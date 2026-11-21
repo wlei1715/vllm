@@ -786,6 +786,7 @@ class ModelConfig:
                 "InklingForCausalLM",
                 "InklingForConditionalGeneration",
                 "Inkling2ForConditionalGeneration",
+                "Inkling2LoopForConditionalGeneration",
             ):
                 self.tokenizer_mode = "inkling"
 

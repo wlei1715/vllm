@@ -1024,6 +1024,12 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         tokenizer_mode="inkling",
         max_model_len=4096,
     ),
+    "Inkling2LoopForConditionalGeneration": _HfExamplesInfo(
+        "thinkingmachines/Inkling-2-Mini",
+        tokenizer_mode="inkling",
+        max_model_len=4096,
+        is_available_online=False,
+    ),
     "IsaacForConditionalGeneration": _HfExamplesInfo(
         "PerceptronAI/Isaac-0.1",
         trust_remote_code=True,

@@ -490,6 +490,10 @@ _MULTIMODAL_MODELS = {
         "vllm.models.kimi_k3",
         "KimiK3ForConditionalGeneration",
     ),
+    "Inkling2LoopForConditionalGeneration": (
+        "vllm.models.inkling2",
+        "Inkling2LoopForConditionalGeneration",
+    ),
     "Inkling2ForConditionalGeneration": (
         "vllm.models.inkling2",
         "Inkling2ForConditionalGeneration",
