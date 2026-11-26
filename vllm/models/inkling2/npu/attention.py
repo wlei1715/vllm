@@ -74,13 +74,51 @@ class Inkling2NpuShortConv(nn.Module):
             )
         # pass_idx -> (W - 1, dim) of the inputs before the current batch.
         self._past: dict[int, torch.Tensor] = {}
+        # Graph mode (6c): fixed-address conv state for NPU graph capture.
+        # `forward` updates the buffer IN PLACE (rolling shift) so a captured
+        # replay advances the state, unlike the `torch.cat` path whose replay
+        # would rewrite the same frozen tensor.
+        self._graph_mode = False
+        self._gbuf: dict[tuple, torch.Tensor] = {}
 
     def reset_state(self) -> None:
         self._past.clear()
+        self._gbuf.clear()
 
     def reset_slot(self, slot: int) -> None:
         for key in [k for k in self._past if k[0] == slot]:
             self._past.pop(key, None)
+        for key in [k for k in self._gbuf if k[0] == slot]:
+            self._gbuf.pop(key, None)
+
+    def enable_graph_mode(self) -> None:
+        self._graph_mode = True
+
+    def _graph_forward(
+        self,
+        x: torch.Tensor,
+        buf: torch.Tensor,
+        dyn: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """T=1 in-place-state variant of the decode fast paths (`ops.py`)."""
+        W = self.kernel_size
+        head_dim = self.dim // max(self.num_heads, 1)
+        if not self.dynamic:
+            w = self.weight.reshape(self.dim, -1).float()
+            xt = torch.cat((buf, x), 0).float()  # (W, C)
+            acc = (w.t() * xt).sum(0)
+            y = (acc + x.squeeze(0).float()) * (W + 1) ** -0.5
+        else:
+            assert dyn is not None
+            xt = torch.cat((buf, x), 0).float()  # (W, C)
+            taps = self.static_w.float() + dyn[0].repeat_interleave(
+                head_dim, dim=0
+            ).t()
+            acc = (taps * xt.flip(0)).sum(0)
+            y = (acc + x.squeeze(0).float()) * (2 * W + 1) ** -0.5
+        # Rolling in-place state update == `cat(past[1:], x)` of the cat path.
+        buf.copy_(torch.cat((buf[1:], x), 0))
+        return y.unsqueeze(0)
 
     def forward(
         self,
@@ -90,7 +128,22 @@ class Inkling2NpuShortConv(nn.Module):
         pass_idx: int = 0,
     ) -> torch.Tensor:
         """`x` bf16 `(T, dim)` -> fp32 conv output `(T, dim)`."""
-        past = self._past.get((current_slot(), pass_idx))
+        key = (current_slot(), pass_idx)
+        if self._graph_mode and x.shape[0] == 1:
+            buf = self._gbuf.get(key)
+            if buf is None:
+                past = self._past.get(key)
+                buf = x.new_zeros((self.kernel_size - 1, self.dim))
+                if past is not None:
+                    buf.copy_(past.to(x.dtype))
+                self._gbuf[key] = buf
+            dyn = None
+            if self.dynamic:
+                assert x_dynamic is not None
+                dyn = torch.nn.functional.linear(x_dynamic, self.weight_proj)
+                dyn = dyn.view(x.shape[0], self.num_heads, self.kernel_size)
+            return self._graph_forward(x, buf, dyn)
+        past = self._past.get(key)
         if self.dynamic:
             assert x_dynamic is not None
             dyn = torch.nn.functional.linear(x_dynamic, self.weight_proj)
@@ -100,7 +153,13 @@ class Inkling2NpuShortConv(nn.Module):
             )
         else:
             y, past = short_conv_static(x, self.weight, past)
-        self._past[(current_slot(), pass_idx)] = past
+        self._past[key] = past
+        # A T>1 continuation (e.g. later chunked-prefill chunks) advanced the
+        # cat-based state: refresh the in-place graph buffer so the next
+        # captured replay continues from the new state.
+        gbuf = self._gbuf.get(key)
+        if gbuf is not None:
+            gbuf.copy_(past.to(gbuf.dtype))
         return y
 
 
@@ -188,6 +247,11 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         # would build.
         self._kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._kpos: dict[int, torch.Tensor] = {}
+        # Graph mode (6c): fixed-size capture-friendly KV cache (see
+        # `enable_graph_mode`); inactive until explicitly enabled.
+        self._graph_mode = False
+        self._s_pad: int | None = None
+        self._gcache: dict = {}
         self._scales_synced = False
         if prefix is not None:
             self._register_in_forward_context(prefix)
@@ -240,6 +304,7 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
     def reset_state(self) -> None:
         self._kv.clear()
         self._kpos.clear()
+        self._gcache.clear()
         self.k_sconv.reset_state()
         self.v_sconv.reset_state()
 
@@ -249,8 +314,75 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         for key in keys:
             self._kv.pop(key, None)
             self._kpos.pop(key, None)
+        for key in [k for k in self._gcache if k[0] == slot]:
+            self._gcache.pop(key, None)
         self.k_sconv.reset_slot(slot)
         self.v_sconv.reset_slot(slot)
+
+    def enable_graph_mode(self, s_pad: int) -> None:
+        """Switch T=1 decode to the fixed-shape capture-friendly cache.
+
+        The cat-based `_kv` cache reallocates every step (growing S, moving
+        addresses), which an NPU graph replay cannot advance.  Graph mode
+        instead preallocates `s_pad` K/V rows plus a device write cursor and
+        appends in place; unused rows hold a +inf position sentinel so the
+        relative-bias -inf masks them out of the softmax (the sentinel
+        distance is negative / out of extent exactly like the real mask).
+        """
+        self._graph_mode = True
+        self._s_pad = s_pad
+        self.k_sconv.enable_graph_mode()
+        self.v_sconv.enable_graph_mode()
+
+    def _graph_cache(self, key):
+        """(Re)create the fixed-size cache entry, seeded from `_kv` if any."""
+        dev = self.wq_du.weight.device
+        cache = {
+            # Zero-filled: unused rows must contribute exactly 0 (bf16
+            # garbage could be inf/NaN and poison the -inf-masked softmax).
+            "k": torch.zeros(
+                self._s_pad, self.num_kv_heads, self.head_dim,
+                dtype=torch.bfloat16, device=dev,
+            ),
+            "v": torch.zeros(
+                self._s_pad, self.num_kv_heads, self.head_dim,
+                dtype=torch.bfloat16, device=dev,
+            ),
+            # Position sentinel: masked out by the relative-bias -inf.
+            "kpos": torch.full(
+                (self._s_pad,), 2**31 - 1, dtype=torch.int64, device=dev
+            ),
+            "wptr": torch.zeros((), dtype=torch.int64, device=dev),
+        }
+        prev = self._kv.get(key)
+        if prev is not None:
+            n = prev[0].shape[0]
+            assert n <= self._s_pad, (key, n, self._s_pad)
+            cache["k"][:n].copy_(prev[0])
+            cache["v"][:n].copy_(prev[1])
+            cache["kpos"][:n].copy_(self._kpos[key])
+            cache["wptr"].fill_(n)
+        return cache
+
+    def _graph_forward(self, positions, k, v, pass_idx: int):
+        """T=1 attention over the fixed-size cache (capture-friendly).
+
+        Same math as the T=1 branch of `forward`, but K/V are appended in
+        place at the device write cursor and attention runs over the full
+        padded cache (sentinel rows get -inf relative bias -> zero probs).
+        """
+        key = (current_slot(), pass_idx)
+        cache = self._gcache.get(key)
+        if cache is None:
+            cache = self._graph_cache(key)
+            self._gcache[key] = cache
+        kc, vc, kpos, wptr = cache["k"], cache["v"], cache["kpos"], cache["wptr"]
+        # Append this step's K/V and position at the cursor, then advance.
+        kc.index_copy_(0, wptr.view(1), k)
+        vc.index_copy_(0, wptr.view(1), v)
+        kpos.index_copy_(0, wptr.view(1), positions)
+        wptr.add_(1)
+        return kc, vc, kpos
 
     def forward(
         self,
@@ -298,16 +430,37 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
 
         # Present K/V of this visit into the pass's cache, attend over all.
         state_key = (current_slot(), pass_idx)
-        prev = self._kv.get(state_key)
-        if prev is not None:
-            k_all = torch.cat((prev[0], k), 0)
-            v_all = torch.cat((prev[1], v), 0)
-            kpos = torch.cat((self._kpos[state_key], positions), 0)
+        if self._graph_mode and T == 1:
+            # Capture-friendly fixed-size cache: in-place append at the
+            # device cursor, attention over the padded buffer (sentinel
+            # positions get -inf relative bias -> zero probability).
+            k_all, v_all, kpos = self._graph_forward(positions, k, v, pass_idx)
         else:
-            k_all, v_all = k, v
-            kpos = positions
-        self._kv[state_key] = (k_all, v_all)
-        self._kpos[state_key] = kpos
+            prev = self._kv.get(state_key)
+            if prev is not None:
+                k_all = torch.cat((prev[0], k), 0)
+                v_all = torch.cat((prev[1], v), 0)
+                kpos = torch.cat((self._kpos[state_key], positions), 0)
+            else:
+                k_all, v_all = k, v
+                kpos = positions
+            self._kv[state_key] = (k_all, v_all)
+            self._kpos[state_key] = kpos
+            # A T>1 forward (prefill / later chunked-prefill chunks) grew the
+            # cat-based cache: re-seed the fixed-size graph cache in place so
+            # the next captured replay continues from the new state (the
+            # captured graph keeps pointing at the same buffers).
+            cache = self._gcache.get(state_key)
+            if cache is not None:
+                n2 = k_all.shape[0]
+                assert n2 <= self._s_pad, (state_key, n2, self._s_pad)
+                cache["k"].zero_()
+                cache["v"].zero_()
+                cache["k"][:n2].copy_(k_all)
+                cache["v"][:n2].copy_(v_all)
+                cache["kpos"].fill_(2**31 - 1)
+                cache["kpos"][:n2].copy_(kpos)
+                cache["wptr"].fill_(n2)
 
         import os
 

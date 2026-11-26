@@ -141,11 +141,20 @@ class Inkling2NpuExperts(nn.Module):
             return torch.zeros_like(x)
 
         if self._gmm_available is None:
-            self._gmm_available = hasattr(torch, "npu") and hasattr(
-                getattr(torch, "npu"), "npu_grouped_matmul"
-            )
-            if self._gmm_available:
-                import torch_npu  # noqa: F401  (registers npu_grouped_matmul)
+            # NOTE (6c): `npu_grouped_matmul` lives at the `torch_npu` TOP
+            # LEVEL, and `torch.npu` IS `torch_npu.npu` -- so probing
+            # `hasattr(torch.npu, "npu_grouped_matmul")` is always False and
+            # every run silently took the slow per-expert fallback (48
+            # nonzero/tolist host syncs per decode step).  Probe the module
+            # that actually owns the symbol.
+            try:
+                import torch_npu
+
+                self._gmm_available = hasattr(
+                    torch_npu, "npu_grouped_matmul"
+                )
+            except ImportError:
+                self._gmm_available = False
 
         if self._gmm_available:
             xp = x[s_tok].contiguous()

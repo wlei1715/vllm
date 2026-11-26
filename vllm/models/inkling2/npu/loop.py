@@ -242,6 +242,15 @@ class NpuLoopModel(nn.Module):
         for layer in self.layers:
             layer.reset_slot(slot)
 
+    def enable_graph_mode(self, s_pad: int) -> None:
+        """Switch every layer's decode path to fixed-shape capture-friendly
+        state (see `Inkling2NpuAttention.enable_graph_mode`); T>1 forwards
+        (prefill) keep the eager cat-based caches."""
+        for layer in self.layers:
+            layer.attn.enable_graph_mode(s_pad)
+            layer.attn_sconv.enable_graph_mode()
+            layer.mlp_sconv.enable_graph_mode()
+
     def _max_loop_blocks(self) -> int:
         num_blocks = max_blocks = 0
         core = self.loop_core
@@ -434,6 +443,12 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         # Engine-mode state-slot bookkeeping (see `forward` / `_assign_slots`).
         self._slot_seq = 0
         self._live: dict[int, tuple[int, int]] = {}
+        # NPU graph capture for T=1 engine decode steps (6c): per-slot
+        # {graph, static input buffers, static output}.  Only used when the
+        # engine opts in via `enable_graph_mode`; capture is lazy (first
+        # decode step of a request) and invalidated with the slot's state.
+        self._graphs: dict[int, dict] = {}
+        self._graph_s_pad: int | None = None
         self.model = NpuLoopModel(text_config, prefix=f"{prefix}model.")
         self.lm_head = nn.Linear(
             text_config.hidden_size,
@@ -444,6 +459,7 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
 
     def reset_state(self) -> None:
         self.model.reset_state()
+        self._graphs.clear()
 
     def load_weights(self, weights) -> set[str]:
         params = dict(self.named_parameters())
@@ -560,6 +576,11 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         import os
 
         segs = [(lo, hi) for lo, hi in reqs]
+        # Auto-opt engine decode into NPU graph capture (6c).  Env switch
+        # INKLING2_NPU_GRAPH=0 keeps the eager path for A/B measurement.
+        if self._graph_s_pad is None and os.getenv("INKLING2_NPU_GRAPH", "1") != "0":
+            max_pos = getattr(self.config, "max_position_embeddings", None)
+            self.enable_graph_mode(int(max_pos) if max_pos else 2048)
         assigned = self._assign_slots(segs, positions)
         dump = os.getenv("INKLING2_DUMP_REQS")
         if dump:
@@ -573,6 +594,20 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                 )
         hidden_rows = []
         for slot, lo, hi in assigned:
+            if (
+                hi - lo == 1
+                and self._graph_s_pad is not None
+            ):
+                # T=1 engine decode: fixed-shape NPU graph capture/replay
+                # (6c).  The first step of a request runs eagerly (seeding
+                # the fixed caches from the prefill's cat-path state) and
+                # captures; later steps replay.
+                hidden_rows.append(
+                    self._engine_graph_step(
+                        slot, input_ids[lo:hi], positions[lo:hi]
+                    )
+                )
+                continue
             ops.set_current_slot(slot)
             seg_ids = input_ids[lo:hi]
             seg_pos = positions[lo:hi]
@@ -601,6 +636,7 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                 slot = self._slot_seq
                 self._slot_seq += 1
                 self.model.reset_slot(slot)
+                self._graphs.pop(slot, None)
             else:
                 cands = [
                     s
@@ -618,12 +654,14 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                     slot = self._slot_seq
                     self._slot_seq += 1
                     self.model.reset_slot(slot)
+                    self._graphs.pop(slot, None)
             used.add(slot)
             new_live[slot] = (last + 1, order)
             out.append((slot, lo, hi))
         for s in self._live:
             if s not in used:
                 self.model.reset_slot(s)
+                self._graphs.pop(s, None)
         self._live = new_live
         return out
 
@@ -671,6 +709,61 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """`VllmModel` protocol: text embeddings (norm applied)."""
         return self.model.embed_norm(self.model.embed_tokens(input_ids))
+
+    def enable_graph_mode(self, s_pad: int) -> None:
+        """Opt the decode path into NPU-graph capture mode (6c)."""
+        self.model.enable_graph_mode(s_pad)
+        self._graph_s_pad = s_pad
+
+    def _engine_graph_step(
+        self, slot: int, ids_t: torch.Tensor, pos_t: torch.Tensor
+    ) -> torch.Tensor:
+        """One T=1 engine decode step via NPU graph capture/replay.
+
+        First step of a request: eager (seeds the fixed caches from the
+        prefill's cat-path state, warms every kernel), then captures the
+        identical-shape graph.  Ascend capture only RECORDS (verified: the
+        write cursor does not advance), so the graph is good for the next
+        steps.  Later steps: copy the new token/position into the static
+        buffers and replay.
+        """
+        st = self._graphs.get(slot)
+        if st is None:
+            ops.set_current_slot(slot)
+            embeds = self.model.embed_norm(self.model.embed_tokens(ids_t))
+            hidden = self.model(pos_t, embeds)
+            g = torch.npu.NPUGraph()
+            ids_buf = ids_t.clone()
+            pos_buf = pos_t.clone()
+            with torch.npu.graph(g):
+                hidden_s = self.decode_step(ids_buf, pos_buf, slot)
+            self._graphs[slot] = {
+                "g": g,
+                "ids": ids_buf,
+                "pos": pos_buf,
+                "hidden": hidden_s,
+            }
+            return hidden
+        st["ids"].copy_(ids_t)
+        st["pos"].copy_(pos_t)
+        st["g"].replay()
+        return st["hidden"]
+
+    def decode_step(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        slot: int = 0,
+    ) -> torch.Tensor:
+        """Sync-free T=1 decode forward, the graph-capture entry point.
+
+        Embeddings + loop core only -- no reset / metadata / batching
+        logic, no host reads of device tensors, so the whole call can be
+        recorded by `torch.npu.NPUGraph` and replayed per decode step.
+        """
+        ops.set_current_slot(slot)
+        embeds = self.model.embed_norm(self.model.embed_tokens(input_ids))
+        return self.model(positions, embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """The sampler's logits: fp32 lm_head (see `forward_logits`)."""
