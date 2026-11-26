@@ -77,8 +77,17 @@ class Inkling2NpuGate(nn.Module):
 
 
 class Inkling2NpuExperts(nn.Module):
-    """BF16 experts: per-expert GEMM loop (correctness-first; the
-    vllm-ascend fused_moe path is a later performance step)."""
+    """BF16 experts on Ascend grouped GEMM.
+
+    Weights are held in `[E, K, N]` (in, out) orientation because
+    `torch_npu.npu_grouped_matmul` requires that layout — the checkpoint
+    stores `[E, N, K]`, so `load_weights` transposes on the way in (memory
+    neutral: the parameter replaces the shard rather than adding a copy).
+
+    One grouped GEMM covers all active experts per projection, using a
+    per-expert `group_list` of token counts (0 for inactive experts), so no
+    weight gather/copy per call is needed.
+    """
 
     def __init__(self, config) -> None:
         super().__init__()
@@ -87,50 +96,130 @@ class Inkling2NpuExperts(nn.Module):
         self.up_cap = config.mlp_up_softcap
         self.w13_weight = nn.Parameter(
             torch.empty(
-                self.num_experts, 2 * config.intermediate_size, config.hidden_size,
+                self.num_experts, config.hidden_size, 2 * config.intermediate_size,
                 dtype=torch.bfloat16,
             ),
             requires_grad=False,
         )
         self.w2_weight = nn.Parameter(
             torch.empty(
-                self.num_experts, config.hidden_size, config.intermediate_size,
+                self.num_experts, config.intermediate_size, config.hidden_size,
                 dtype=torch.bfloat16,
             ),
             requires_grad=False,
         )
+        # Per-expert token counts are reused every call; `_group_list` is
+        # filled in place to avoid an allocation + H2D copy per step.
+        self._group_list: torch.Tensor | None = None
+        self._gmm_available: bool | None = None
 
     @staticmethod
     def _load_weight(param: nn.Parameter, loaded: torch.Tensor) -> None:
-        assert loaded.shape == param.shape and loaded.dtype == param.dtype, (
-            f"{loaded.shape} {loaded.dtype} != {param.shape} {param.dtype}"
+        """Checkpoint stores `[E, N, K]`; the parameter holds `[E, K, N]`."""
+        expected = loaded.shape[:1] + (loaded.shape[2], loaded.shape[1])
+        assert param.shape == expected and loaded.dtype == param.dtype, (
+            f"{loaded.shape} -> {expected} != {param.shape} {param.dtype}"
         )
-        param.data.copy_(loaded)
+        param.data.copy_(loaded.transpose(1, 2))
 
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor
     ) -> torch.Tensor:
         """bf16 `(T, H)` x, fp32 `(T, topk)` weights, `(T, topk)` ids ->
         bf16 `(T, H)`."""
-        out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
-        # Loop over experts; per expert a dense GEMM over its token rows.
-        for expert in range(self.num_experts):
-            token, slot = (ids == expert).nonzero(as_tuple=True)
-            if token.numel() == 0:
-                continue
-            gate_up = torch.nn.functional.linear(
-                x[token], self.w13_weight[expert]
+        T, K = ids.shape
+        flat_ids = ids.reshape(-1)
+        flat_tok = (
+            torch.arange(T, device=x.device).unsqueeze(1).expand(T, K).reshape(-1)
+        )
+        order = torch.argsort(flat_ids, stable=True)
+        s_ids = flat_ids[order]
+        s_tok = flat_tok[order]
+        s_w = weights.reshape(-1)[order]
+        n = s_ids.numel()
+        if n == 0:
+            return torch.zeros_like(x)
+
+        if self._gmm_available is None:
+            self._gmm_available = hasattr(torch, "npu") and hasattr(
+                getattr(torch, "npu"), "npu_grouped_matmul"
             )
-            # w13 rows are interleaved: even rows gate, odd rows up.
-            gate, up = gate_up[:, 0::2], gate_up[:, 1::2]
-            act = (
-                self.gate_cap * torch.tanh(gate.float() / self.gate_cap)
-                * torch.sigmoid(gate.float())
-                * self.up_cap * torch.tanh(up.float() / self.up_cap)
-            )
-            act = (act * weights[token, slot, None]).to(torch.bfloat16)
-            down = torch.nn.functional.linear(act, self.w2_weight[expert])
+            if self._gmm_available:
+                import torch_npu  # noqa: F401  (registers npu_grouped_matmul)
+
+        if self._gmm_available:
+            xp = x[s_tok].contiguous()
+            gl = self._group_list
+            if gl is None or gl.numel() != self.num_experts:
+                gl = torch.zeros(
+                    self.num_experts, dtype=torch.int64, device=x.device
+                )
+                self._group_list = gl
+            gl.zero_()
+            gl.index_add_(0, s_ids, torch.ones_like(s_ids))
+            from torch_npu import npu_grouped_matmul
+
+            gate_up = npu_grouped_matmul(
+                [xp],
+                weight=[self.w13_weight],
+                group_list=gl,
+                group_list_type=1,
+                split_item=2,
+                group_type=0,
+            )[0]
+            token = s_tok
+            sw = s_w
+        else:
+            bounds = (s_ids[1:] != s_ids[:-1]).nonzero().flatten().tolist()
+            starts = [0] + [b + 1 for b in bounds]
+            ends = [b + 1 for b in bounds] + [n]
+            chunks, toks, ws = [], [], []
+            for s, e in zip(starts, ends):
+                expert = int(s_ids[s])
+                tok = s_tok[s:e]
+                gu = torch.nn.functional.linear(
+                    x[tok], self.w13_weight[expert].t()
+                )
+                chunks.append(gu)
+                toks.append(tok)
+                ws.append(s_w[s:e])
+            if not chunks:
+                return torch.zeros_like(x)
+            gate_up = torch.cat(chunks, 0)
+            token = torch.cat(toks, 0)
+            sw = torch.cat(ws, 0)
+
+        # w13 rows are interleaved: even rows gate, odd rows up.
+        gate, up = gate_up[:, 0::2], gate_up[:, 1::2]
+        act = (
+            self.gate_cap * torch.tanh(gate.float() / self.gate_cap)
+            * torch.sigmoid(gate.float())
+            * self.up_cap * torch.tanh(up.float() / self.up_cap)
+        )
+        act = (act * sw[:, None]).to(torch.bfloat16)
+
+        if self._gmm_available:
+            from torch_npu import npu_grouped_matmul
+
+            down = npu_grouped_matmul(
+                [act.contiguous()],
+                weight=[self.w2_weight],
+                group_list=gl,
+                group_list_type=1,
+                split_item=2,
+                group_type=0,
+            )[0]
+            out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
             out.index_add_(0, token, down.float())
+            return out.to(x.dtype)
+
+        out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        for s, e in zip(starts, ends):
+            expert = int(s_ids[s])
+            down = torch.nn.functional.linear(
+                act[s:e], self.w2_weight[expert].t()
+            )
+            out.index_add_(0, s_tok[s:e], down.float())
         return out.to(x.dtype)
 
 

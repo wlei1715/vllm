@@ -480,6 +480,13 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                 idx = 0 if shard is None else shard
                 assert param.data[idx].shape == tensor.shape, name
                 param.data[idx].copy_(tensor.to(param.dtype))
+            elif name.endswith(("experts.w13_weight", "experts.w2_weight")):
+                # Expert weights are stored `[E, K, N]` for grouped GEMM; the
+                # checkpoint has `[E, N, K]`.  Transposing on load is memory
+                # neutral (the parameter replaces the shard).
+                expected = tensor.shape[:1] + (tensor.shape[2], tensor.shape[1])
+                assert param.shape == expected, (name, param.shape, tensor.shape)
+                param.data.copy_(tensor.transpose(1, 2).to(param.dtype))
             else:
                 assert param.shape == tensor.shape, (name, param.shape, tensor.shape)
                 param.data.copy_(tensor.to(param.dtype))
