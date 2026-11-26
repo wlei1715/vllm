@@ -576,11 +576,15 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         import os
 
         segs = [(lo, hi) for lo, hi in reqs]
-        # Auto-opt engine decode into NPU graph capture (6c).  Env switch
-        # INKLING2_NPU_GRAPH=0 keeps the eager path for A/B measurement.
+        # Auto-opt engine decode into NPU graph capture (6c).  Env switches:
+        # INKLING2_NPU_GRAPH=0 keeps the eager path (A/B measurement);
+        # INKLING2_NPU_GRAPH_S_PAD sizes the padded capture cache (must
+        # cover the request context; the checkpoint's
+        # max_position_embeddings is 1M and would OOM, so default 2048 =
+        # the engine's max_model_len this round).
         if self._graph_s_pad is None and os.getenv("INKLING2_NPU_GRAPH", "1") != "0":
-            max_pos = getattr(self.config, "max_position_embeddings", None)
-            self.enable_graph_mode(int(max_pos) if max_pos else 2048)
+            s_pad = int(os.getenv("INKLING2_NPU_GRAPH_S_PAD", "2048"))
+            self.enable_graph_mode(s_pad)
         assigned = self._assign_slots(segs, positions)
         dump = os.getenv("INKLING2_DUMP_REQS")
         if dump:
