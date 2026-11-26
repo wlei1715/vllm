@@ -19,6 +19,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+
 from .ops import (
     feature_rms,
     gate_sink,
@@ -97,11 +99,21 @@ class Inkling2NpuShortConv(nn.Module):
         return y
 
 
-class Inkling2NpuAttention(nn.Module):
-    """`Inkling2Attention` (nvidia/attention.py) as plain torch."""
+class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
+    """`Inkling2Attention` (nvidia/attention.py) as plain torch.
 
-    def __init__(self, config, is_local: bool) -> None:
+    With a `prefix` (engine mode) the layer registers itself in the
+    static forward context and answers the v1 engine's per-layer KV
+    cache queries (`get_kv_cache_config` / `get_attn_backend`), so the
+    v1 allocator sizes and binds a paged cache for it.  This round the
+    compute still runs over the self-managed per-pass tensor caches
+    (`_kv`/`_kpos`, validated in round 3); reading the engine's paged
+    cache is the next round.
+    """
+
+    def __init__(self, config, is_local: bool, prefix: str | None = None) -> None:
         super().__init__()
+        self.prefix = prefix
         self.is_local = is_local
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
@@ -164,6 +176,53 @@ class Inkling2NpuAttention(nn.Module):
         # would build.
         self._kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._kpos: dict[int, torch.Tensor] = {}
+        if prefix is not None:
+            self._register_in_forward_context(prefix)
+
+    # ----- v1 engine layer interface (AttentionLayerBase) -----
+
+    def _register_in_forward_context(self, prefix: str) -> None:
+        from vllm.config import get_current_vllm_config
+
+        try:
+            cfg = get_current_vllm_config()
+        except AssertionError:
+            # Standalone use (no engine): the v1 layer interface is not
+            # consulted; the engine always builds models inside a config
+            # context, so there registration is never skipped.
+            return
+        forward_context = cfg.compilation_config
+        if prefix in forward_context.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        forward_context.static_forward_context[prefix] = self
+
+    def get_attn_backend(self) -> type:
+        from .backend import Inkling2NpuAttentionBackend
+
+        return Inkling2NpuAttentionBackend
+
+    def get_kv_cache_config(self, vllm_config):
+        from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            FullAttentionManager,
+            SlidingWindowManager,
+        )
+        from vllm.v1.kv_cache_interface import AttentionSpec
+
+        spec = AttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_dim,
+            dtype=kv_cache_dtype_str_to_dtype(
+                vllm_config.cache_config.cache_dtype,
+                vllm_config.model_config,
+            ),
+        )
+        if self.window is not None:
+            return SlidingWindowManager.layer_config(
+                spec, sliding_window=self.window
+            )
+        return FullAttentionManager.layer_config(spec)
 
     def reset_state(self) -> None:
         self._kv.clear()

@@ -2,6 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Looped Inkling2, NPU platform branch (Ascend 910B) — correctness-first.
 
+Round 4 scope: the **vLLM v1 engine interface** — the model class answers
+the v1 runner's calls (`forward` returns hidden states, `compute_logits`
+projects them for the sampler), each attention layer registers as a
+`AttentionLayerBase` with a declared `AttentionSpec` (sliding-window /
+full) so the v1 allocator sizes and pools a paged KV cache for it, and a
+minimal custom backend (`backend.py`) supplies the pass-through metadata
+builder.  Constraint this round: one request per batch
+(`max_num_seqs=1`); the compute still runs over the round-3 self-managed
+per-pass caches, so the paged cache is sized but not yet read.
+
 Round 2 scope: the **full text stack** in torch, mirroring
 `nvidia/loop.py` + `nvidia/model.py`:
 
@@ -96,14 +106,23 @@ class NpuMessageController(nn.Module):
 class NpuDecoderLayer(nn.Module):
     """One decoder layer (loop core layers carry the stream controllers)."""
 
-    def __init__(self, config: Inkling2ModelConfig, layer_id: int) -> None:
+    def __init__(
+        self, config: Inkling2ModelConfig, layer_id: int, prefix: str = ""
+    ) -> None:
         super().__init__()
         self.layer_id = layer_id
         self.is_local = layer_id in config.local_layer_ids
         hidden = config.hidden_size
         eps = config.rms_norm_eps
         self.num_attn_inputs = 1 if self.is_local else 3
-        self.attn = Inkling2NpuAttention(config, self.is_local)
+        # Engine mode (`prefix` given): the attention layer registers as a
+        # v1 AttentionLayerBase under "<prefix>layers.<i>.attn" so the v1
+        # allocator enumerates and sizes its KV cache.  Standalone mode
+        # (prefix ""): no registration, self-managed caches only.
+        self.attn = Inkling2NpuAttention(
+            config, self.is_local,
+            prefix=f"{prefix}layers.{layer_id}.attn" if prefix else None,
+        )
         self.attn_norm = NpuRMSNorm(hidden, eps, num_inputs=self.num_attn_inputs)
         self.mlp_norm = NpuRMSNorm(hidden, eps)
         self.mlp = Inkling2NpuMoE(config)
@@ -164,7 +183,7 @@ class NpuDecoderLayer(nn.Module):
 class NpuLoopModel(nn.Module):
     """`Inkling2LoopModel`: block stack + the loop visit schedule."""
 
-    def __init__(self, config: Inkling2ModelConfig) -> None:
+    def __init__(self, config: Inkling2ModelConfig, prefix: str = "") -> None:
         super().__init__()
         self.config = config
         self.block_size = config.n_layers_per_attn_res_block
@@ -177,7 +196,8 @@ class NpuLoopModel(nn.Module):
         )
         self.embed_norm = NpuRMSNorm(self.hidden_size, config.rms_norm_eps)
         self.layers = nn.ModuleList(
-            NpuDecoderLayer(config, i) for i in range(config.num_hidden_layers)
+            NpuDecoderLayer(config, i, prefix=prefix)
+            for i in range(config.num_hidden_layers)
         )
         self.attn_res = NpuAttnRes(config)
         self.norm = NpuRMSNorm(self.hidden_size, config.rms_norm_eps)
@@ -400,7 +420,8 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         text_config = getattr(config, "text_config", config)
         assert text_config.loop_config is not None, "loop checkpoint required"
         self.config = text_config
-        self.model = NpuLoopModel(text_config)
+        self.vllm_config = vllm_config
+        self.model = NpuLoopModel(text_config, prefix=f"{prefix}model.")
         self.lm_head = nn.Linear(
             text_config.hidden_size,
             text_config.padded_vocab_size or text_config.vocab_size,
@@ -458,12 +479,53 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
 
     def forward(
         self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        intermediate_tensors=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """v1 engine forward: hidden states of all scheduled tokens.
+
+        Text-only, single request per batch this round (scheduler
+        `max_num_seqs=1`): a batch whose first token sits at position 0
+        starts a new request, so the per-pass KV / conv-state caches are
+        reset; a batch continuing at positions > 0 (decode steps, later
+        chunks of a chunked prefill) reuses them — the round-3 A1 test
+        showed chunked continuation is bit-exact with same-chunking
+        recompute.
+        """
+        assert input_ids is not None, "text-only round: input_ids required"
+        if positions is None:
+            positions = torch.arange(input_ids.shape[0], device=input_ids.device)
+        if bool(positions[0] == 0):
+            self.reset_state()
+        if inputs_embeds is None:
+            inputs_embeds = self.model.embed_norm(
+                self.model.embed_tokens(input_ids)
+            )
+        return self.model(positions, inputs_embeds)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """`VllmModel` protocol: text embeddings (norm applied)."""
+        return self.model.embed_norm(self.model.embed_tokens(input_ids))
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The sampler's logits: fp32 lm_head (see `forward_logits`)."""
+        w = self.lm_head.weight
+        fp32 = getattr(self, "_lm_fp32", None)
+        if fp32 is None or fp32.device != w.device:
+            self._lm_fp32 = w.detach().float()
+        return torch.nn.functional.linear(hidden_states.float(), self._lm_fp32)
+
+    def forward_logits(
+        self,
         input_ids: torch.Tensor,
         positions: torch.Tensor | None = None,
         *,
         incremental: bool = False,
-    ):
-        """Text-only forward over a single sequence (offline parity runs).
+    ) -> torch.Tensor:
+        """Standalone single-sequence path (offline parity runs).
 
         `incremental=False` (default): one independent single-sequence run —
         the KV / conv-state caches are reset first. `incremental=True`:
@@ -473,19 +535,11 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         """
         if not incremental:
             self.reset_state()
-        num_tokens = input_ids.shape[0]
         if positions is None:
-            positions = torch.arange(num_tokens, device=input_ids.device)
+            positions = torch.arange(input_ids.shape[0], device=input_ids.device)
         embeds = self.model.embed_norm(self.model.embed_tokens(input_ids))
         hidden = self.model(positions, embeds)
-        # One persistent fp32 copy of the unembedding matrix: casting it per
-        # forward churns ~2GB through the NPU caching allocator and
-        # fragments HBM (OOM at ~50GB of weights on a 64GB card).
-        w = self.lm_head.weight
-        fp32 = getattr(self, "_lm_fp32", None)
-        if fp32 is None or fp32.device != w.device:
-            self._lm_fp32 = w.detach().float()
-        return torch.nn.functional.linear(hidden.float(), self._lm_fp32)
+        return self.compute_logits(hidden)
 
 
 __all__ = ["Inkling2LoopForConditionalGeneration"]
