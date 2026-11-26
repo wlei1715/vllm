@@ -61,18 +61,20 @@ def rms_norm(
 
 def l2_clip(
     x: torch.Tensor,
-    scale: torch.Tensor,
+    scale: torch.Tensor | None,
     threshold: float,
     eps: float = CLIP_EPS,
     tau: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """`x * scale` clipped to an L2 norm of `threshold`, then `* tau`.
 
-    `x` is `(T, H, D)` bf16, `scale` `(H, D)`; `tau` fp32 `(T,)` or None.
-    Returns fp32; the kernels round to bf16 on store (callers do).
+    `x` is `(T, H, D)` bf16, `scale` `(H, D)` fp32/bf16 or None (no scale);
+    `tau` fp32 `(T,)` or None.  Returns fp32; the kernels round to bf16 on
+    store (callers do).  Pass `scale` pre-converted to fp32 to skip a
+    per-call cast.
     """
-    y = x.float() * scale.float()
-    norm = y.square().sum(-1, keepdim=True).sqrt()
+    y = x.float() if scale is None else x.float() * scale
+    norm = torch.linalg.vector_norm(y, dim=-1, keepdim=True)
     y = y * (threshold / (norm + eps)).clamp(max=1.0)
     if tau is not None:
         # The kernel rounds the clipped value, then scales by fp32 tau.
@@ -102,6 +104,13 @@ def short_conv_static(
         return x.float(), past if past is not None else x.new_zeros((W - 1, C))
     if past is None:
         past = x.new_zeros((W - 1, C))
+    if T == 1:
+        # Decode fast path: one elementwise dot over the W-deep window
+        # (mathematically identical to the loop below, fewer kernels).
+        xt = torch.cat((past.to(x.dtype), x), 0).float()  # (W, C)
+        acc = (w.t() * xt).sum(0)
+        y = (acc + x.squeeze(0).float()) * (W + 1) ** -0.5
+        return y.unsqueeze(0), xt[-(W - 1):].to(x.dtype)
     xt = torch.cat((past.to(x.dtype), x), 0).float()
     acc = torch.zeros(T, C, dtype=torch.float32, device=x.device)
     for j in range(W):
@@ -128,6 +137,14 @@ def short_conv_dynamic(
         return x.float(), past if past is not None else x.new_zeros((W - 1, C))
     if past is None:
         past = x.new_zeros((W - 1, C))
+    if T == 1:
+        # Decode fast path: row k of the taps pairs with lag k, i.e. the
+        # reversed window (mathematically identical to the loop below).
+        xt = torch.cat((past.to(x.dtype), x), 0).float()  # (W, C)
+        taps = static_w.float() + dyn[0].repeat_interleave(head_dim, dim=0).t()
+        acc = (taps * xt.flip(0)).sum(0)
+        y = (acc + x.squeeze(0).float()) * (2 * W + 1) ** -0.5
+        return y.unsqueeze(0), xt[-(W - 1):].to(x.dtype)
     xt = torch.cat((past.to(x.dtype), x), 0).float()
     dyn_exp = dyn.float().repeat_interleave(head_dim, dim=1)  # (T, C, W)
     acc = torch.zeros(T, C, dtype=torch.float32, device=x.device)

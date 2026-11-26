@@ -149,6 +149,13 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         self.wk_dv = nn.Linear(hidden, kv_size, bias=False, dtype=bf16)
         self.wv_dv = nn.Linear(hidden, kv_size, bias=False, dtype=bf16)
         self.wo_ud = nn.Linear(q_size, hidden, bias=False, dtype=bf16)
+        # fp32 copies of the (fixed) clip scales: avoids a per-call cast.
+        self.register_buffer(
+            "_q_scale_f", torch.empty(self.num_heads, self.head_dim), persistent=False
+        )
+        self.register_buffer(
+            "_r_scale_f", torch.empty(self.num_heads, self.d_rel), persistent=False
+        )
         self.rel_logits_proj = nn.Parameter(
             torch.empty(self.d_rel, self.rel_extent, dtype=bf16),
             requires_grad=False,
@@ -181,6 +188,7 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         # would build.
         self._kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._kpos: dict[int, torch.Tensor] = {}
+        self._scales_synced = False
         if prefix is not None:
             self._register_in_forward_context(prefix)
 
@@ -258,6 +266,10 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         assert x_k is not None and x_v is not None
         T = x_q.shape[0]
         H, D, Hkv = self.num_heads, self.head_dim, self.num_kv_heads
+        if not self._scales_synced:
+            self._q_scale_f.copy_(self.q_scale.float())
+            self._r_scale_f.copy_(self.r_scale.float())
+            self._scales_synced = True
 
         q = self.wq_du(x_q).view(T, H, D)
         r = self.wr_du(x_q).view(T, H, self.d_rel)
@@ -267,8 +279,8 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         v = self.wv_dv(x_v).view(T, Hkv, D)
 
         # Prologue: clip q/r (round then scale by tau), K/V convs + norms.
-        q_clip = l2_clip(q, self.q_scale, self.qk_clip, tau=tau).to(torch.bfloat16)
-        r_clip = l2_clip(r, self.r_scale, self.rel_clip, tau=tau).to(torch.bfloat16)
+        q_clip = l2_clip(q, self._q_scale_f, self.qk_clip, tau=tau).to(torch.bfloat16)
+        r_clip = l2_clip(r, self._r_scale_f, self.rel_clip, tau=tau).to(torch.bfloat16)
         # The kernels round the conv output to the projection dtype before
         # the K clip / V norm (nvidia/ops/sconv.py:795).
         k = self.k_sconv(
@@ -281,7 +293,7 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
             x_dynamic=x_v,
             pass_idx=pass_idx,
         ).view(T, Hkv, D).to(torch.bfloat16)
-        k = l2_clip(k, torch.ones_like(k), self.qk_clip).to(torch.bfloat16)
+        k = l2_clip(k, None, self.qk_clip).to(torch.bfloat16)
         v = feature_rms(v, self.eps).to(torch.bfloat16)
 
         # Present K/V of this visit into the pass's cache, attend over all.
@@ -313,18 +325,43 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
 
         S = k_all.shape[0]
         group = H // Hkv
-        kk = k_all.repeat_interleave(group, dim=1)  # (S, H, D)
-        vv = v_all.repeat_interleave(group, dim=1)
 
-        scores = torch.einsum("thd,shd->hts", q_clip.float(), kk.float())
-        scores = scores * self.scaling
-        scores = scores + self._rel_scores(r_clip, positions, kpos, H)
-        mask = self._mask(positions, kpos)
-        if mask is not None:
-            scores = scores.masked_fill(mask.unsqueeze(0), float("-inf"))
-        lse = torch.logsumexp(scores, dim=-1)  # (H, T)
-        probs = torch.softmax(scores, dim=-1)
-        out = torch.einsum("hts,shd->thd", probs, vv.float())
+        # Grouped (GQA) scores without materializing the repeated K/V:
+        # q (Hkv, g, D) x k^T (Hkv, D, S) -> (Hkv, g, S) == (H, S) at T=1.
+        # The relative bias already carries -inf for every position the
+        # causal/sliding mask would block when `window == rel_extent` (the
+        # real local config) and for negative distances (full layers), so
+        # the explicit mask only fires when the two disagree.
+        need_mask = self.window is not None and self.window != self.rel_extent
+        kf = k_all.float() if T == 1 else None
+        rel = self._rel_scores(r_clip, positions, kpos, H)  # (H, T, S)
+        if T == 1:
+            qg = q_clip.float().view(Hkv, group, D)
+            scores = torch.matmul(qg, kf.permute(1, 2, 0))  # (Hkv,g,S)
+            scores = scores * self.scaling + rel.view(Hkv, group, S)
+            if need_mask:
+                scores = scores.masked_fill(
+                    self._mask(positions, kpos).unsqueeze(0), float("-inf")
+                )
+            lse = torch.logsumexp(
+                scores.reshape(H, S), dim=-1, keepdim=True
+            )  # (H, 1) == (H, T)
+            probs = torch.softmax(scores, dim=-1)
+            out = torch.matmul(probs, v_all.float().permute(1, 0, 2))  # (Hkv,g,D)
+            out = out.reshape(1, H, D)
+        else:
+            kk = k_all.repeat_interleave(group, dim=1)  # (S, H, D)
+            vv = v_all.repeat_interleave(group, dim=1)
+            scores = torch.einsum("thd,shd->hts", q_clip.float(), kk.float())
+            scores = scores * self.scaling
+            scores = scores + rel
+            if need_mask:
+                scores = scores.masked_fill(
+                    self._mask(positions, kpos).unsqueeze(0), float("-inf")
+                )
+            lse = torch.logsumexp(scores, dim=-1)  # (H, T)
+            probs = torch.softmax(scores, dim=-1)
+            out = torch.einsum("hts,shd->thd", probs, vv.float())
         out = gate_sink(out, gate, lse, sinks)
         return self.wo_ud(out.reshape(T, H * D).to(torch.bfloat16))
 
