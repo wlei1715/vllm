@@ -288,14 +288,16 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         self._s_pad: int | None = None
         self._gcache: dict = {}
         self._scales_synced = False
-        # 6e: lazily built CONCATENATED projection weights — the local layers'
-        # six prologue GEMMs share one input, so they fuse into a single
-        # GEMM on the concatenated weight (bit-exact: same K-reduction, the
-        # aclnn tiling does not change it — verified 6e_proj_micro.py, and
-        # it halves the projection time in-graph: 41.8 -> 18.6 us/visit).
-        # Full layers group per input: (wq, wr, gate, sink) on x_q and
-        # (wk, wv) on x_k.
-        self._fused_w: tuple | None = None
+        # 6e: projection fusion (6 prologue GEMMs on one input -> 1 GEMM on a
+        # concatenated weight, 41.8 -> 18.6 us/visit in isolation) was
+        # EVALUATED AND REMOVED.  Root cause of its model-level mismatch:
+        # on looped visits the local layers receive THREE DISTINCT blended
+        # inputs (attn/k/v streams, `loop.py:_run_layer`), so "local layers
+        # have x_q == x_k == x_v" holds only on non-blended visits; the
+        # fused path computed k/v from x_q and changed the token stream
+        # (same-process A/B: 24-token logits maxdiff 76, tokens 5/24).
+        # It also gave no measurable whole-step gain, so it is not worth
+        # re-introducing with a guard.
         # 6d: fused attention core (torch_npu.npu_fusion_attention), opt-in
         # via INKLING2_NPU_FIA=1 (default off -- keeps the torch composite as
         # the A/B reference). Empirically confirmed (probe_fia_pse.py +
@@ -482,30 +484,12 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
             self._r_scale_f.copy_(self.r_scale.float())
             self._scales_synced = True
 
-        # 6e: the prologue GEMMs on one input run as a single GEMM over the
-        # concatenated weight (bit-exact, see `_build_fused_w`).  Local
-        # layers fuse all six (x_q == x_k == x_v); full layers fuse the
-        # four x_q projections (x_k / x_v are distinct inputs there).
-        qs, rs, gs, ss = H * D, H * self.d_rel, H * D, H
-        ks = Hkv * D
-        if self.is_local:
-            w_all, _ = self._build_fused_w()
-            y = torch.nn.functional.linear(x_q, w_all)
-            q = y[:, :qs].reshape(T, H, D)
-            r = y[:, qs:qs + rs].reshape(T, H, self.d_rel)
-            gate = y[:, qs + rs:qs + rs + gs].reshape(T, H, D)
-            sinks = y[:, qs + rs + gs:qs + rs + gs + ss].reshape(T, H)
-            k = y[:, qs + rs + gs + ss:qs + rs + gs + ss + ks].reshape(T, Hkv, D)
-            v = y[:, qs + rs + gs + ss + ks:].reshape(T, Hkv, D)
-        else:
-            w_q, _ = self._build_fused_w()
-            y = torch.nn.functional.linear(x_q, w_q)
-            q = y[:, :qs].reshape(T, H, D)
-            r = y[:, qs:qs + rs].reshape(T, H, self.d_rel)
-            gate = y[:, qs + rs:qs + rs + gs].reshape(T, H, D)
-            sinks = y[:, qs + rs + gs:].reshape(T, H)
-            k = self.wk_dv(x_k).view(T, Hkv, D)
-            v = self.wv_dv(x_v).view(T, Hkv, D)
+        q = self.wq_du(x_q).view(T, H, D)
+        r = self.wr_du(x_q).view(T, H, self.d_rel)
+        gate = self.gate_attn(x_q).view(T, H, D)
+        sinks = self.attn_sink_proj(x_q).view(T, H)
+        k = self.wk_dv(x_k).view(T, Hkv, D)
+        v = self.wv_dv(x_v).view(T, Hkv, D)
 
         # Prologue: clip q/r (round then scale by tau), K/V convs + norms.
         q_clip = l2_clip(q, self._q_scale_f, self.qk_clip, tau=tau).to(torch.bfloat16)
@@ -678,41 +662,6 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         out = ret[0].squeeze(0).permute(1, 0, 2).float()  # (T, H, D)
         lse = (ret[1][..., 0] + ret[2][..., 0].log()).squeeze(0)  # (H, T)
         return out, lse
-
-    def _build_fused_w(self) -> tuple:
-        """Concatenated projection weights (see `__init__`, 6e)."""
-        fw = self._fused_w
-        dev = self.wq_du.weight.device
-        if fw is None or fw[0].device != dev:
-            if self.is_local:
-                w_all = torch.cat(
-                    [
-                        self.wq_du.weight,
-                        self.wr_du.weight,
-                        self.gate_attn.weight,
-                        self.attn_sink_proj.weight,
-                        self.wk_dv.weight,
-                        self.wv_dv.weight,
-                    ],
-                    0,
-                ).contiguous()
-                fw = (w_all, None)
-            else:
-                w_q = torch.cat(
-                    [
-                        self.wq_du.weight,
-                        self.wr_du.weight,
-                        self.gate_attn.weight,
-                        self.attn_sink_proj.weight,
-                    ],
-                    0,
-                ).contiguous()
-                w_kv = torch.cat(
-                    [self.wk_dv.weight, self.wv_dv.weight], 0
-                ).contiguous()
-                fw = (w_q, w_kv)
-            self._fused_w = fw
-        return fw
 
     def _rel_scores(
         self,
