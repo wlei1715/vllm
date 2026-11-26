@@ -31,6 +31,8 @@ plain torch tensors here), and fused Ascend kernels (performance round).
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
@@ -519,6 +521,9 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         # decode step of a request) and invalidated with the slot's state.
         self._graphs: dict[int, dict] = {}
         self._graph_s_pad: int | None = None
+        # 6e: max capture pad (from INKLING2_NPU_GRAPH_S_PAD); rows above it
+        # are an error in graph mode, so it must cover max_model_len.
+        self._graph_cap: int | None = None
         self.model = NpuLoopModel(text_config, prefix=f"{prefix}model.")
         self.lm_head = nn.Linear(
             text_config.hidden_size,
@@ -654,6 +659,7 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         # the engine's max_model_len this round).
         if self._graph_s_pad is None and os.getenv("INKLING2_NPU_GRAPH", "1") != "0":
             s_pad = int(os.getenv("INKLING2_NPU_GRAPH_S_PAD", "2048"))
+            self._graph_cap = s_pad
             self.enable_graph_mode(s_pad)
         assigned = self._assign_slots(segs, positions)
         dump = os.getenv("INKLING2_DUMP_REQS")
@@ -789,6 +795,50 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         self.model.enable_graph_mode(s_pad)
         self._graph_s_pad = s_pad
 
+    def _graph_buckets(self) -> list[int]:
+        """s_pad bucket candidates (6e), ascending, capped at the max."""
+        raw = os.environ.get(
+            "INKLING2_NPU_GRAPH_BUCKETS", "256,512,1024,2048"
+        )
+        cap = self._graph_cap or self._graph_s_pad or 2048
+        out = []
+        for tok in raw.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            b = int(tok)
+            if 0 < b <= cap:
+                out.append(b)
+        if not out or out[-1] != cap:
+            out.append(cap)
+        return sorted(set(out))
+
+    def _bucket_for(self, need: int) -> int | None:
+        """Smallest bucket that covers `need` rows, or None if too long."""
+        buckets = self._graph_buckets()
+        for b in buckets:
+            if b >= need:
+                return b
+        return None
+
+    def _grow_graph_bucket(self, slot: int, need: int) -> bool:
+        """Re-size a slot's capture bucket after its context outgrew it.
+
+        Moves the live graph-mode K/V rows (including decoded tokens) to a
+        bigger bucket and drops the slot's graph so the next decode step
+        re-captures.  Returns False when even the max bucket is too small
+        (the caller then stays on the eager path).
+        """
+        b = self._bucket_for(need)
+        if b is None:
+            return False
+        for layer in self.model.layers:
+            layer.attn.resize_graph_caches(slot, b)
+        self.model.enable_graph_mode(b)
+        self._graph_s_pad = b
+        self._graphs.pop(slot, None)
+        return True
+
     def _engine_graph_step(
         self, slot: int, ids_t: torch.Tensor, pos_t: torch.Tensor
     ) -> torch.Tensor:
@@ -802,7 +852,33 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         buffers and replay.
         """
         st = self._graphs.get(slot)
+        # 6e s_pad bucketing: capture at the smallest bucket that covers
+        # this request's context (short chats then pay the 256-row padded
+        # softmax, not the 2048-row one).  On growth, the slot's live K/V is
+        # moved up a bucket and the graph re-captured.
+        need = int(pos_t[0]) + 1
+        if st is not None and need > st["s_pad"]:
+            if not self._grow_graph_bucket(slot, need):
+                raise RuntimeError(
+                    f"context {need} exceeds the max graph s_pad "
+                    f"({self._graph_s_pad}); raise INKLING2_NPU_GRAPH_S_PAD "
+                    "to at least max_model_len"
+                )
+            st = None
         if st is None:
+            b = self._bucket_for(need)
+            if b is None:
+                raise RuntimeError(
+                    f"context {need} exceeds the max graph s_pad "
+                    f"({self._graph_s_pad}); raise INKLING2_NPU_GRAPH_S_PAD "
+                    "to at least max_model_len"
+                )
+            if self._graph_s_pad != b:
+                # Only new cache allocations use the new bucket; other
+                # slots keep their buffers and their captured graphs
+                # replay unchanged.
+                self.model.enable_graph_mode(b)
+                self._graph_s_pad = b
             ops.set_current_slot(slot)
             embeds = self.model.embed_norm(self.model.embed_tokens(ids_t))
             hidden = self.model(pos_t, embeds)
@@ -816,6 +892,7 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                 "ids": ids_buf,
                 "pos": pos_buf,
                 "hidden": hidden_s,
+                "s_pad": b,
             }
             return hidden
         st["ids"].copy_(ids_t)

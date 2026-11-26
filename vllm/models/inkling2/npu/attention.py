@@ -386,23 +386,24 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         self.k_sconv.enable_graph_mode()
         self.v_sconv.enable_graph_mode()
 
-    def _graph_cache(self, key):
+    def _graph_cache(self, key, s_pad_override: int | None = None):
         """(Re)create the fixed-size cache entry, seeded from `_kv` if any."""
         dev = self.wq_du.weight.device
+        s_pad = self._s_pad if s_pad_override is None else s_pad_override
         cache = {
             # Zero-filled: unused rows must contribute exactly 0 (bf16
             # garbage could be inf/NaN and poison the -inf-masked softmax).
             "k": torch.zeros(
-                self._s_pad, self.num_kv_heads, self.head_dim,
+                s_pad, self.num_kv_heads, self.head_dim,
                 dtype=torch.bfloat16, device=dev,
             ),
             "v": torch.zeros(
-                self._s_pad, self.num_kv_heads, self.head_dim,
+                s_pad, self.num_kv_heads, self.head_dim,
                 dtype=torch.bfloat16, device=dev,
             ),
             # Position sentinel: masked out by the relative-bias -inf.
             "kpos": torch.full(
-                (self._s_pad,), 2**31 - 1, dtype=torch.int64, device=dev
+                (s_pad,), 2**31 - 1, dtype=torch.int64, device=dev
             ),
             "wptr": torch.zeros((), dtype=torch.int64, device=dev),
         }
@@ -415,6 +416,32 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
             cache["kpos"][:n].copy_(self._kpos[key])
             cache["wptr"].fill_(n)
         return cache
+
+    def resize_graph_caches(self, slot: int, s_pad: int) -> None:
+        """Re-allocate one slot's fixed KV caches at a new bucket size (6e).
+
+        Used when a decode request outgrows its s_pad bucket: the captured
+        graph is dropped and re-captured, and this carries the live K/V
+        rows over (the graph-mode path appends to `_gcache` only, so the
+        cat-path `_kv` is NOT authoritative here).  Non-destructive for
+        other slots.
+        """
+        self._s_pad = s_pad
+        for key in [k for k in self._gcache if k[0] == slot]:
+            old = self._gcache[key]
+            n = int(old["wptr"].item())  # host read, outside capture
+            assert n <= s_pad, (key, n, s_pad)
+            new = self._graph_cache(key, s_pad_override=s_pad)
+            # `_graph_cache` seeds from `_kv` (prefill-era); overwrite with
+            # the live graph-mode rows, which include decoded tokens.
+            new["k"].zero_()
+            new["v"].zero_()
+            new["kpos"].fill_(2**31 - 1)
+            new["k"][:n].copy_(old["k"][:n])
+            new["v"][:n].copy_(old["v"][:n])
+            new["kpos"][:n].copy_(old["kpos"][:n])
+            new["wptr"].fill_(n)
+            self._gcache[key] = new
 
     def _graph_forward(self, positions, k, v, pass_idx: int):
         """T=1 attention over the fixed-size cache (capture-friendly).
@@ -523,7 +550,11 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
             cache = self._gcache.get(state_key)
             if cache is not None:
                 n2 = k_all.shape[0]
-                assert n2 <= self._s_pad, (state_key, n2, self._s_pad)
+                # Buffer size, not the global `_s_pad`: with s_pad buckets
+                # (6e) another slot's cache may use a different bucket.
+                assert n2 <= cache["k"].shape[0], (
+                    state_key, n2, cache["k"].shape[0]
+                )
                 cache["k"].zero_()
                 cache["v"].zero_()
                 cache["k"][:n2].copy_(k_all)
