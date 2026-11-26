@@ -157,11 +157,17 @@ class Inkling2NpuAttention(nn.Module):
             dynamic_input_size=dynamic_input,
             num_heads=self.num_kv_heads,
         )
-        # pass_idx -> (k, v) of the tokens seen so far.
+        # pass_idx -> (k, v) of the tokens seen so far, and their positions.
+        # A decode step appends only the new tokens' K/V (the caches persist
+        # across calls until `reset_state`), so prefill + step-by-step
+        # decoding reuses the same tensors a single full-sequence forward
+        # would build.
         self._kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._kpos: dict[int, torch.Tensor] = {}
 
     def reset_state(self) -> None:
         self._kv.clear()
+        self._kpos.clear()
         self.k_sconv.reset_state()
         self.v_sconv.reset_state()
 
@@ -209,20 +215,22 @@ class Inkling2NpuAttention(nn.Module):
         if pass_idx in self._kv:
             k_all = torch.cat((self._kv[pass_idx][0], k), 0)
             v_all = torch.cat((self._kv[pass_idx][1], v), 0)
+            kpos = torch.cat((self._kpos[pass_idx], positions), 0)
         else:
             k_all, v_all = k, v
+            kpos = positions
         self._kv[pass_idx] = (k_all, v_all)
+        self._kpos[pass_idx] = kpos
 
         S = k_all.shape[0]
-        assert S == T, "correctness round: one full-sequence forward per pass"
         group = H // Hkv
         kk = k_all.repeat_interleave(group, dim=1)  # (S, H, D)
         vv = v_all.repeat_interleave(group, dim=1)
 
         scores = torch.einsum("thd,shd->hts", q_clip.float(), kk.float())
         scores = scores * self.scaling
-        scores = scores + self._rel_scores(r_clip, positions, H, T, S)
-        mask = self._mask(positions, T, S)
+        scores = scores + self._rel_scores(r_clip, positions, kpos, H)
+        mask = self._mask(positions, kpos)
         if mask is not None:
             scores = scores.masked_fill(mask.unsqueeze(0), float("-inf"))
         lse = torch.logsumexp(scores, dim=-1)  # (H, T)
@@ -234,14 +242,17 @@ class Inkling2NpuAttention(nn.Module):
     def _rel_scores(
         self,
         r_clip: torch.Tensor,
-        positions: torch.Tensor,
+        q_pos: torch.Tensor,
+        k_pos: torch.Tensor,
         H: int,
-        T: int,
-        S: int,
     ) -> torch.Tensor:
-        """Relative logits `(H, T, S)` indexed by key distance."""
+        """Relative logits `(H, T, S)` indexed by key distance.
+
+        `k_pos` are the positions of the cached keys (prefill + decoded so
+        far); `q_pos` the current step's query positions.
+        """
         rel = rel_bias(r_clip, self.rel_logits_proj, self.rel_extent)  # (T,H,E)
-        dist = positions[:, None] - positions[None, :]  # (T, S)
+        dist = q_pos[:, None] - k_pos[None, :]  # (T, S)
         idx = dist.clamp(0, self.rel_extent - 1)
         bias = rel.permute(1, 0, 2).gather(
             2, idx.unsqueeze(0).expand(H, -1, -1)
@@ -254,8 +265,8 @@ class Inkling2NpuAttention(nn.Module):
             bad = bad | (dist >= self.rel_extent)
         return bias.masked_fill(bad.unsqueeze(0), float("-inf"))
 
-    def _mask(self, positions: torch.Tensor, T: int, S: int) -> torch.Tensor | None:
-        dist = positions[:, None] - positions[None, :]
+    def _mask(self, q_pos: torch.Tensor, k_pos: torch.Tensor) -> torch.Tensor | None:
+        dist = q_pos[:, None] - k_pos[None, :]
         bad = dist < 0
         if self.window is not None:
             bad = bad | (dist >= self.window)

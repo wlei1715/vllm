@@ -456,15 +456,36 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         self.model.process_weights_after_loading()
         return loaded
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor | None = None):
-        """Text-only forward over a single sequence (offline parity runs)."""
-        self.reset_state()  # one independent single-sequence run per forward
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        *,
+        incremental: bool = False,
+    ):
+        """Text-only forward over a single sequence (offline parity runs).
+
+        `incremental=False` (default): one independent single-sequence run —
+        the KV / conv-state caches are reset first. `incremental=True`:
+        a decode continuation step — the caches (keyed by loop pass) persist,
+        so calling with the prefill batch once and then single tokens
+        reproduces the full-sequence forward token by token.
+        """
+        if not incremental:
+            self.reset_state()
         num_tokens = input_ids.shape[0]
         if positions is None:
             positions = torch.arange(num_tokens, device=input_ids.device)
         embeds = self.model.embed_norm(self.model.embed_tokens(input_ids))
         hidden = self.model(positions, embeds)
-        return torch.nn.functional.linear(hidden.float(), self.lm_head.weight.float())
+        # One persistent fp32 copy of the unembedding matrix: casting it per
+        # forward churns ~2GB through the NPU caching allocator and
+        # fragments HBM (OOM at ~50GB of weights on a 64GB card).
+        w = self.lm_head.weight
+        fp32 = getattr(self, "_lm_fp32", None)
+        if fp32 is None or fp32.device != w.device:
+            self._lm_fp32 = w.detach().float()
+        return torch.nn.functional.linear(hidden.float(), self._lm_fp32)
 
 
 __all__ = ["Inkling2LoopForConditionalGeneration"]
