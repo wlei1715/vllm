@@ -524,7 +524,11 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
                 kpos = torch.cat((self._kpos[state_key], positions), 0)
             else:
                 k_all, v_all = k, v
-                kpos = positions
+                # `positions` may be a VIEW into an engine-owned buffer that
+                # the engine overwrites on the next step (allocator reuse),
+                # silently corrupting the stored position index of the KV
+                # cache.  Store a copy, never the alias.
+                kpos = positions.contiguous().clone()
             self._kv[state_key] = (k_all, v_all)
             self._kpos[state_key] = kpos
             # A T>1 forward (prefill / later chunked-prefill chunks) grew the
