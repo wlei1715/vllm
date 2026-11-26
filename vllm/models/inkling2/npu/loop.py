@@ -673,10 +673,20 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                     f"ids0={[int(input_ids[lo]) for _, lo, _ in assigned]}\n"
                 )
         hidden_rows = []
+        # Mixed batches (any multi-token eager segment present) must not
+        # touch the NPU graphs at all: capture-then-eager in one forward
+        # corrupts the captured graph (replay later hits an invalid GM
+        # address) and replay-then-eager in one forward crashes outright
+        # (probe experiments E1/E4/E8 vs E2/E6/E9).  Cross-forward eager
+        # work leaves captured graphs valid (E6), so only this forward's
+        # T=1 segments fall back to the eager path; the next all-decode
+        # forward replays the graphs as usual.
+        eager_mix = any(hi - lo > 1 for _, lo, hi in assigned)
         for slot, lo, hi in assigned:
             if (
                 hi - lo == 1
                 and self._graph_s_pad is not None
+                and not eager_mix
             ):
                 # T=1 engine decode: fixed-shape NPU graph capture/replay
                 # (6c).  The first step of a request runs eagerly (seeding
