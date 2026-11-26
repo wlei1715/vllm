@@ -16,6 +16,8 @@ materializes the ``(heads, T, S)`` score matrix).
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
@@ -253,6 +255,15 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         self._s_pad: int | None = None
         self._gcache: dict = {}
         self._scales_synced = False
+        # 6d: fused attention core (torch_npu.npu_fusion_attention), opt-in
+        # via INKLING2_NPU_FIA=1 (default off -- keeps the torch composite as
+        # the A/B reference). Empirically confirmed (probe_fia_pse.py +
+        # 6d_probe_fia_deep.py): `pse` is a PRE-scale additive bias
+        # (softmax(scale*(pse + qk))), so rel-bias/-inf masking folds in as
+        # pse = rel/scale; the returned softmax_max/softmax_sum recover lse
+        # (max + log(sum)) for the sink/gate epilogue; non-contiguous BNSD
+        # views are accepted (no layout copies needed).
+        self._fia = os.environ.get("INKLING2_NPU_FIA", "0") == "1"
         if prefix is not None:
             self._register_in_forward_context(prefix)
 
@@ -486,6 +497,12 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         # real local config) and for negative distances (full layers), so
         # the explicit mask only fires when the two disagree.
         need_mask = self.window is not None and self.window != self.rel_extent
+        if self._fia:
+            out, lse = self._fia_forward(
+                q_clip, r_clip, k_all, v_all, positions, kpos, need_mask, T, H
+            )
+            out = gate_sink(out, gate, lse, sinks)
+            return self.wo_ud(out.reshape(T, H * D).to(torch.bfloat16))
         kf = k_all.float() if T == 1 else None
         rel = self._rel_scores(r_clip, positions, kpos, H)  # (H, T, S)
         if T == 1:
@@ -517,6 +534,60 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
             out = torch.einsum("hts,shd->thd", probs, vv.float())
         out = gate_sink(out, gate, lse, sinks)
         return self.wo_ud(out.reshape(T, H * D).to(torch.bfloat16))
+
+    def _fia_forward(
+        self,
+        q_clip: torch.Tensor,
+        r_clip: torch.Tensor,
+        k_all: torch.Tensor,
+        v_all: torch.Tensor,
+        positions: torch.Tensor,
+        kpos: torch.Tensor,
+        need_mask: bool,
+        T: int,
+        H: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused attention core: `npu_fusion_attention` + rel-bias via `pse`.
+
+        FIA computes `softmax(scale * (pse + qk))` with a PRE-scale additive
+        `pse` (probe-verified, 6b/6d), so the rel-bias (already carrying -inf
+        for negative distances, out-of-extent keys and sentinel padding rows)
+        folds in as `pse = rel / scaling`; tau is already baked into
+        `q_clip`/`r_clip` by `l2_clip`, so the standard `head_dim**-0.5`
+        scale is exact. The returned fp32 softmax stats recover the lse the
+        sink/gate epilogue needs: `lse = softmax_max + log(softmax_sum)`
+        (the stats carry a trailing block dim; index 0 is the value).
+        Non-contiguous BNSD views are accepted by the op, so no layout
+        copies are made. Capture-safe: no host branch depends on tensor
+        values (shapes are static in graph mode).
+        """
+        import torch_npu
+
+        rel = self._rel_scores(r_clip, positions, kpos, H)  # (H, T, S)
+        pse = rel / self.scaling
+        if need_mask:
+            pse = pse.masked_fill(
+                self._mask(positions, kpos).unsqueeze(0), float("-inf")
+            )
+        q_b = q_clip.to(torch.bfloat16).permute(1, 0, 2).unsqueeze(0)  # (1,H,T,D)
+        k_b = k_all.permute(1, 0, 2).unsqueeze(0)  # (1, Hkv, S, D)
+        v_b = v_all.permute(1, 0, 2).unsqueeze(0)
+        # `sync=True` is the ONLY invocation that NPU-graph capture accepts:
+        # FIA internally launches on a sub-stream whose last task is not an
+        # event record, so aclmdlRICaptureEnd fails (107025) unless the op
+        # synchronizes that sub-stream itself (probed across pse/no-pse,
+        # gen_mask_parallel/sync combinations). It is only needed while
+        # capturing/executing the graph (T=1 graph mode); the eager T>1
+        # prefill path stays sync=False to avoid a host sync per visit.
+        ret = torch_npu.npu_fusion_attention(
+            q_b, k_b, v_b, H, "BNSD",
+            pse=pse.bfloat16().unsqueeze(0),  # (1, H, T, S), dtype == qkv
+            scale=self.scaling,
+            sync=self._graph_mode and T == 1,
+        )
+        out = ret[0].squeeze(0).permute(1, 0, 2).float()  # (T, H, D)
+        lse = (ret[1][..., 0] + ret[2][..., 0].log()).squeeze(0)  # (H, T)
+        return out, lse
 
     def _rel_scores(
         self,
