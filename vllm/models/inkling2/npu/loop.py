@@ -37,6 +37,7 @@ from torch import nn
 from ..configs import Inkling2ModelConfig
 from .attention import Inkling2NpuAttention, Inkling2NpuShortConv
 from .moe import Inkling2NpuMoE
+from . import ops
 from .ops import attn_res, blend, log_scaling_tau, rms_norm
 
 LOOP_STREAMS = ("attn", "k", "v", "mlp")
@@ -179,6 +180,11 @@ class NpuDecoderLayer(nn.Module):
         self.attn_sconv.reset_state()
         self.mlp_sconv.reset_state()
 
+    def reset_slot(self, slot: int) -> None:
+        self.attn.reset_slot(slot)
+        self.attn_sconv.reset_slot(slot)
+        self.mlp_sconv.reset_slot(slot)
+
 
 class NpuLoopModel(nn.Module):
     """`Inkling2LoopModel`: block stack + the loop visit schedule."""
@@ -231,6 +237,10 @@ class NpuLoopModel(nn.Module):
     def reset_state(self) -> None:
         for layer in self.layers:
             layer.reset_state()
+
+    def reset_slot(self, slot: int) -> None:
+        for layer in self.layers:
+            layer.reset_slot(slot)
 
     def _max_loop_blocks(self) -> int:
         num_blocks = max_blocks = 0
@@ -421,6 +431,9 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         assert text_config.loop_config is not None, "loop checkpoint required"
         self.config = text_config
         self.vllm_config = vllm_config
+        # Engine-mode state-slot bookkeeping (see `forward` / `_assign_slots`).
+        self._slot_seq = 0
+        self._live: dict[int, tuple[int, int]] = {}
         self.model = NpuLoopModel(text_config, prefix=f"{prefix}model.")
         self.lm_head = nn.Linear(
             text_config.hidden_size,
@@ -498,13 +511,155 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         assert input_ids is not None, "text-only round: input_ids required"
         if positions is None:
             positions = torch.arange(input_ids.shape[0], device=input_ids.device)
-        if bool(positions[0] == 0):
-            self.reset_state()
-        if inputs_embeds is None:
-            inputs_embeds = self.model.embed_norm(
-                self.model.embed_tokens(input_ids)
-            )
-        return self.model(positions, inputs_embeds)
+        import os
+
+        fwd_dump = os.getenv("INKLING2_DUMP_INPUTS")
+        if fwd_dump:
+            with open(fwd_dump, "a") as f:
+                f.write(
+                    f"T={input_ids.shape[0]} pos={positions.tolist()[:8]} "
+                    f"ids={input_ids.tolist()[:8]} "
+                    f"embeds={'yes' if inputs_embeds is not None else 'no'}\n"
+                )
+        reqs = self._batch_requests(positions)
+        if reqs is None:
+            # Standalone / no engine metadata: single request, slot 0.
+            # (The v1 engine's profile run also lands here: a full state
+            # reset clears any engine-path leftovers.)
+            ops.set_current_slot(0)
+            if bool(positions[0] == 0):
+                self.reset_state()
+                self._live = {}
+            if inputs_embeds is None:
+                inputs_embeds = self.model.embed_norm(
+                    self.model.embed_tokens(input_ids)
+                )
+            return self.model(positions, inputs_embeds)
+
+        # Engine path: the batch holds tokens of several requests
+        # (adjacent `query_start_loc` segments).  State slots are assigned
+        # by POSITION CONTINUITY, not by the metadata's `req_idx`: the
+        # engine's `req_idx` is the batch ROW index (`idx_mapping_np` is
+        # `arange`, sliced to the live rows), which SHIFTS whenever a
+        # request finishes (v1 compacts the batch), silently re-keying
+        # live requests onto finished requests' state.  Instead: a segment
+        # starting at position 0 (prefill / first chunked-prefill chunk)
+        # gets a fresh monotonic slot; a continuation segment reuses the
+        # live slot whose expected next position equals its first position
+        # (tie-broken by row proximity -- rows shift by small deltas on
+        # compaction).  Slots no segment claims are finished: freed.  The
+        # segments run sequentially in Python -- the module-global slot
+        # (`ops.set_current_slot`) is therefore race-free under TP=1.
+        import os
+
+        segs = [(lo, hi) for lo, hi in reqs]
+        assigned = self._assign_slots(segs, positions)
+        dump = os.getenv("INKLING2_DUMP_REQS")
+        if dump:
+            with open(dump, "a") as f:
+                f.write(
+                    f"T={input_ids.shape[0]} n_reqs={len(segs)} "
+                    f"slots={[s for s, _, _ in assigned]} "
+                    f"pos0={[int(positions[lo]) for _, lo, _ in assigned]} "
+                    f"bounds={[(lo, hi) for _, lo, hi in assigned]} "
+                    f"ids0={[int(input_ids[lo]) for _, lo, _ in assigned]}\n"
+                )
+        hidden_rows = []
+        for slot, lo, hi in assigned:
+            ops.set_current_slot(slot)
+            seg_ids = input_ids[lo:hi]
+            seg_pos = positions[lo:hi]
+            if inputs_embeds is not None:
+                seg_embeds = inputs_embeds[lo:hi]
+            else:
+                seg_embeds = self.model.embed_norm(
+                    self.model.embed_tokens(seg_ids)
+                )
+            hidden_rows.append(self.model(seg_pos, seg_embeds))
+        return torch.cat(hidden_rows, 0)
+
+    def _assign_slots(
+        self,
+        segs: list[tuple[int, int]],
+        positions: torch.Tensor,
+    ) -> list[tuple[int, int, int]]:
+        """Map `(lo, hi)` segments to stable state slots (see forward)."""
+        out: list[tuple[int, int, int]] = []
+        used: set[int] = set()
+        new_live: dict[int, tuple[int, int]] = {}
+        for order, (lo, hi) in enumerate(segs):
+            first = int(positions[lo])
+            last = int(positions[hi - 1])
+            if first == 0:
+                slot = self._slot_seq
+                self._slot_seq += 1
+                self.model.reset_slot(slot)
+            else:
+                cands = [
+                    s
+                    for s, (nxt, _row) in self._live.items()
+                    if nxt == first and s not in used
+                ]
+                if cands:
+                    # Prefer the live slot whose row was closest: batch
+                    # compaction shifts rows by small deltas.
+                    cands.sort(key=lambda s: abs(self._live[s][1] - order))
+                    slot = cands[0]
+                else:
+                    # Unknown continuation (no matching live slot): treat
+                    # as a fresh request to never read foreign state.
+                    slot = self._slot_seq
+                    self._slot_seq += 1
+                    self.model.reset_slot(slot)
+            used.add(slot)
+            new_live[slot] = (last + 1, order)
+            out.append((slot, lo, hi))
+        for s in self._live:
+            if s not in used:
+                self.model.reset_slot(s)
+        self._live = new_live
+        return out
+
+    def _batch_requests(self, positions: torch.Tensor):
+        """`(lo, hi)` per non-empty request segment, or None if unavailable.
+
+        Segments come from the common attention metadata's
+        `query_start_loc` (the engine token layout is grouped by request,
+        adjacent).  Returns None outside the engine (standalone parity
+        runs) or when the metadata is missing.
+        """
+        try:
+            from vllm.forward_context import get_forward_context
+
+            fc = get_forward_context()
+        except Exception:
+            return None
+        raw = getattr(fc, "attn_metadata", None)
+        if isinstance(raw, dict):
+            md = next(iter(raw.values()))
+        elif isinstance(raw, list) and raw and isinstance(raw[0], dict):
+            md = next(iter(raw[0].values()))
+        else:
+            md = raw
+        if md is None:
+            return None
+        try:
+            qsl = md.query_start_loc_cpu
+        except AttributeError:
+            return None
+        if qsl is None:
+            return None
+        bounds = qsl.tolist() if not isinstance(qsl, list) else qsl
+        num_reqs = len(bounds) - 1
+        if num_reqs < 1:
+            return None
+        segs = []
+        for b in range(num_reqs):
+            lo, hi = int(bounds[b]), int(bounds[b + 1])
+            if lo == hi:
+                continue  # padded row
+            segs.append((lo, hi))
+        return segs or None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """`VllmModel` protocol: text embeddings (norm applied)."""
@@ -516,7 +671,21 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         fp32 = getattr(self, "_lm_fp32", None)
         if fp32 is None or fp32.device != w.device:
             self._lm_fp32 = w.detach().float()
-        return torch.nn.functional.linear(hidden_states.float(), self._lm_fp32)
+        out = torch.nn.functional.linear(hidden_states.float(), self._lm_fp32)
+        import os
+
+        dump = os.getenv("INKLING2_DUMP_LOGITS")
+        if dump:
+            top = torch.topk(out[-1].float(), 5)
+            with open(dump, "a") as f:
+                f.write(
+                    f"T={hidden_states.shape[0]} "
+                    + repr([int(t) for t in top.indices.tolist()])
+                    + " "
+                    + repr([round(v, 4) for v in top.values.tolist()])
+                    + "\n"
+                )
+        return out
 
     def forward_logits(
         self,
@@ -533,6 +702,7 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         so calling with the prefill batch once and then single tokens
         reproduces the full-sequence forward token by token.
         """
+        ops.set_current_slot(0)
         if not incremental:
             self.reset_state()
         if positions is None:

@@ -236,6 +236,30 @@ def expert_activation(
     )
 
 
+# ---------------------------------------------------------------------------
+# Per-request state slot.
+#
+# The engine batches tokens of several requests into one forward; the
+# self-managed per-pass KV / conv caches must therefore be keyed per
+# request too.  The slot is the v1 request-table index (`req_idx` from the
+# common attention metadata): stable for a request's lifetime, reused only
+# after the request finished (and every reuse starts with a prefill at
+# position 0, which resets the slot -- see loop.py).  Standalone use keeps
+# slot 0.  TP=1 executes the request segments sequentially in Python, so a
+# module-global "current slot" is race-free.
+
+_current_slot = 0
+
+
+def set_current_slot(slot: int) -> None:
+    global _current_slot
+    _current_slot = int(slot)
+
+
+def current_slot() -> int:
+    return _current_slot
+
+
 __all__ = [
     "attn_res",
     "blend",
@@ -245,7 +269,9 @@ __all__ = [
     "l2_clip",
     "log_scaling_tau",
     "rel_bias",
+    "current_slot",
     "rms_norm",
+    "set_current_slot",
     "short_conv_dynamic",
     "short_conv_static",
 ]

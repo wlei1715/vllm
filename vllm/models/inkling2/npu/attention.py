@@ -22,6 +22,7 @@ from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 from .ops import (
+    current_slot,
     feature_rms,
     gate_sink,
     l2_clip,
@@ -77,6 +78,10 @@ class Inkling2NpuShortConv(nn.Module):
     def reset_state(self) -> None:
         self._past.clear()
 
+    def reset_slot(self, slot: int) -> None:
+        for key in [k for k in self._past if k[0] == slot]:
+            self._past.pop(key, None)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -85,7 +90,7 @@ class Inkling2NpuShortConv(nn.Module):
         pass_idx: int = 0,
     ) -> torch.Tensor:
         """`x` bf16 `(T, dim)` -> fp32 conv output `(T, dim)`."""
-        past = self._past.get(pass_idx)
+        past = self._past.get((current_slot(), pass_idx))
         if self.dynamic:
             assert x_dynamic is not None
             dyn = torch.nn.functional.linear(x_dynamic, self.weight_proj)
@@ -95,7 +100,7 @@ class Inkling2NpuShortConv(nn.Module):
             )
         else:
             y, past = short_conv_static(x, self.weight, past)
-        self._past[pass_idx] = past
+        self._past[(current_slot(), pass_idx)] = past
         return y
 
 
@@ -230,6 +235,15 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         self.k_sconv.reset_state()
         self.v_sconv.reset_state()
 
+    def reset_slot(self, slot: int) -> None:
+        """Drop one request slot's per-pass caches (request finished/reused)."""
+        keys = [key for key in self._kv if key[0] == slot]
+        for key in keys:
+            self._kv.pop(key, None)
+            self._kpos.pop(key, None)
+        self.k_sconv.reset_slot(slot)
+        self.v_sconv.reset_slot(slot)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -271,15 +285,31 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         v = feature_rms(v, self.eps).to(torch.bfloat16)
 
         # Present K/V of this visit into the pass's cache, attend over all.
-        if pass_idx in self._kv:
-            k_all = torch.cat((self._kv[pass_idx][0], k), 0)
-            v_all = torch.cat((self._kv[pass_idx][1], v), 0)
-            kpos = torch.cat((self._kpos[pass_idx], positions), 0)
+        state_key = (current_slot(), pass_idx)
+        prev = self._kv.get(state_key)
+        if prev is not None:
+            k_all = torch.cat((prev[0], k), 0)
+            v_all = torch.cat((prev[1], v), 0)
+            kpos = torch.cat((self._kpos[state_key], positions), 0)
         else:
             k_all, v_all = k, v
             kpos = positions
-        self._kv[pass_idx] = (k_all, v_all)
-        self._kpos[pass_idx] = kpos
+        self._kv[state_key] = (k_all, v_all)
+        self._kpos[state_key] = kpos
+
+        import os
+
+        attn_dump = os.getenv("INKLING2_DUMP_ATTN")
+        if attn_dump and (self.prefix or "").endswith("layers.0.attn"):
+            prev_s = 0 if prev is None else int(prev[0].shape[0])
+            ksum = float(k_all[: max(prev_s, 1)].float().abs().sum())
+            with open(attn_dump, "a") as f:
+                f.write(
+                    f"L0 slot={state_key[0]} pass={pass_idx} T={T} "
+                    f"S_prev={prev_s} S_now={int(k_all.shape[0])} "
+                    f"kpos_head={kpos[:8].tolist()} "
+                    f"kpos_tail={kpos[-4:].tolist()} ksum={ksum:.4f}\n"
+                )
 
         S = k_all.shape[0]
         group = H // Hkv
