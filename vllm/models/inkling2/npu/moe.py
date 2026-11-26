@@ -112,6 +112,10 @@ class Inkling2NpuExperts(nn.Module):
         # filled in place to avoid an allocation + H2D copy per step.
         self._group_list: torch.Tensor | None = None
         self._gmm_available: bool | None = None
+        # 6e: cached constant device buffers — `arange` and `ones` launch a
+        # kernel per call otherwise (values never change for a given shape).
+        self._flat_tok: torch.Tensor | None = None
+        self._ones: torch.Tensor | None = None
 
     @staticmethod
     def _load_weight(param: nn.Parameter, loaded: torch.Tensor) -> None:
@@ -129,9 +133,12 @@ class Inkling2NpuExperts(nn.Module):
         bf16 `(T, H)`."""
         T, K = ids.shape
         flat_ids = ids.reshape(-1)
-        flat_tok = (
-            torch.arange(T, device=x.device).unsqueeze(1).expand(T, K).reshape(-1)
-        )
+        flat_tok = self._flat_tok
+        if flat_tok is None or flat_tok.shape[0] != T * K:
+            flat_tok = (
+                torch.arange(T, device=x.device).unsqueeze(1).expand(T, K).reshape(-1)
+            )
+            self._flat_tok = flat_tok
         order = torch.argsort(flat_ids, stable=True)
         s_ids = flat_ids[order]
         s_tok = flat_tok[order]
@@ -165,7 +172,11 @@ class Inkling2NpuExperts(nn.Module):
                 )
                 self._group_list = gl
             gl.zero_()
-            gl.index_add_(0, s_ids, torch.ones_like(s_ids))
+            ones = self._ones
+            if ones is None or ones.shape[0] != n or ones.device != s_ids.device:
+                ones = torch.ones(n, dtype=s_ids.dtype, device=s_ids.device)
+                self._ones = ones
+            gl.index_add_(0, s_ids, ones)
             from torch_npu import npu_grouped_matmul
 
             gate_up = npu_grouped_matmul(
@@ -198,12 +209,15 @@ class Inkling2NpuExperts(nn.Module):
             token = torch.cat(toks, 0)
             sw = torch.cat(ws, 0)
 
-        # w13 rows are interleaved: even rows gate, odd rows up.
-        gate, up = gate_up[:, 0::2], gate_up[:, 1::2]
+        # w13 rows are interleaved: even rows gate, odd rows up.  One fp32 cast of
+        # the whole gate_up (6e) instead of four strided per-half casts —
+        # elementwise casts, values identical.
+        gu32 = gate_up.float()
+        gate, up = gu32[:, 0::2], gu32[:, 1::2]
         act = (
-            self.gate_cap * torch.tanh(gate.float() / self.gate_cap)
-            * torch.sigmoid(gate.float())
-            * self.up_cap * torch.tanh(up.float() / self.up_cap)
+            self.gate_cap * torch.tanh(gate / self.gate_cap)
+            * torch.sigmoid(gate)
+            * self.up_cap * torch.tanh(up / self.up_cap)
         )
         act = (act * sw[:, None]).to(torch.bfloat16)
 

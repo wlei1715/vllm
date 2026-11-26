@@ -38,7 +38,14 @@ from ..configs import Inkling2ModelConfig
 from .attention import Inkling2NpuAttention, Inkling2NpuShortConv
 from .moe import Inkling2NpuMoE
 from . import ops
-from .ops import attn_res, blend, log_scaling_tau, rms_norm
+from .ops import (
+    attn_res,
+    attn_res_view,
+    blend,
+    blend_fast,
+    log_scaling_tau,
+    rms_norm,
+)
 
 LOOP_STREAMS = ("attn", "k", "v", "mlp")
 
@@ -55,9 +62,20 @@ class NpuRMSNorm(nn.Module):
             requires_grad=False,
         )
         self.eps = eps
+        # 6e: fp32 copy of the (constant) weight, built lazily — kills a
+        # per-call select+cast; `rms_norm`'s `weight.float()` is a no-op on it
+        # and the values are identical.
+        self._w32: torch.Tensor | None = None
+
+    def w32(self) -> torch.Tensor:
+        w = self._w32
+        if w is None or w.device != self.weight.device:
+            self._w32 = self.weight.detach().float()
+            w = self._w32
+        return w
 
     def forward(self, x: torch.Tensor, index: int = 0) -> torch.Tensor:
-        return rms_norm(x, self.weight[index], self.eps)
+        return rms_norm(x, self.w32()[index], self.eps)
 
 
 class NpuAttnRes(nn.Module):
@@ -134,6 +152,10 @@ class NpuDecoderLayer(nn.Module):
             self.controllers = nn.ModuleDict(
                 {s: NpuMessageController(rank, hidden) for s in LOOP_STREAMS}
             )
+            # 6e: pre-stacked / pre-transposed constant controller weights
+            # for the two `blend` call patterns (see `blend`); built lazily
+            # so weight loading / `.to(device)` order does not matter.
+            self._blend_pre: tuple | None = None
 
     def attention(
         self,
@@ -154,6 +176,42 @@ class NpuDecoderLayer(nn.Module):
             pass_idx=pass_idx,
         )
 
+    def _blend_precomputed(self) -> tuple:
+        """Pre-transposed constant weights for the ("attn","k","v") and
+        ("mlp",) `blend` calls (6e): stacking/transposing the constant
+        controller weights per call cost ~90 µs/call in the graph (measured,
+        6e_opt_micro.py); the precomputed layout is bit-identical."""
+        pre = self._blend_pre
+        if pre is None:
+            down4 = torch.stack(
+                [self.controllers[s].down_weight for s in LOOP_STREAMS]
+            )
+            up4 = torch.stack(
+                [
+                    torch.cat(
+                        [
+                            self.controllers[s].gain_weight,
+                            self.controllers[s].forget_weight,
+                        ],
+                        0,
+                    )
+                    for s in LOOP_STREAMS
+                ]
+            )
+            w_attn = self.attn_norm.w32()
+            if w_attn.shape[0] == 1:
+                w_attn = w_attn.expand(3, -1)
+            pre = (
+                (down4[:3].transpose(1, 2).contiguous(),
+                 up4[:3].transpose(1, 2).contiguous().float(),
+                 w_attn),
+                (down4[3:].transpose(1, 2).contiguous(),
+                 up4[3:].transpose(1, 2).contiguous().float(),
+                 self.mlp_norm.w32()),
+            )
+            self._blend_pre = pre
+        return pre
+
     def blend(
         self,
         streams: tuple[str, ...],
@@ -162,6 +220,16 @@ class NpuDecoderLayer(nn.Module):
         norm: NpuRMSNorm,
         norm_index: int | None = None,
     ) -> torch.Tensor:
+        if norm_index is None and streams in (("attn", "k", "v"), ("mlp",)) and (
+            (len(streams) == 3 and norm is self.attn_norm)
+            or (len(streams) == 1 and norm is self.mlp_norm)
+        ):
+            down_t, up_t32, w32 = self._blend_precomputed()[
+                0 if len(streams) == 3 else 1
+            ]
+            if w32.shape[0] == 1 and len(streams) == 3:
+                w32 = w32.expand(3, -1)
+            return blend_fast(dest, message, down_t, up_t32, w32, norm.eps)
         down = torch.stack([self.controllers[s].down_weight for s in streams])
         up = torch.stack(
             [
@@ -278,10 +346,9 @@ class NpuLoopModel(nn.Module):
         messages = None
         if bank is not None:
             # Four streams' messages: a mix of the bank's two blocks.
-            messages = attn_res(
-                bank[:1],
-                bank[1],
-                None,
+            # (bank is a contiguous clone: both sources + last are its rows.)
+            messages = attn_res_view(
+                bank,
                 self.message_queries[i - self.loop_core.start],
                 None,
                 0.0,
@@ -304,24 +371,28 @@ class NpuLoopModel(nn.Module):
         first = i % self.block_size == 0
         attn_out = layer.attn_sconv(attn_partial, pass_idx=pass_idx)  # fp32
         if first:
-            mlp_in = attn_res(
-                stack[: num_blocks + 1],
-                attn_out,
-                None,
+            # sources = stack[:nb+1], last = attn_out: the contiguous view
+            # stack[:nb+2] covers both (its last row is overwritten by the
+            # fp32 `tail`); `num_blocks + 2 <= stack rows` because a
+            # block-starting visit has num_blocks < max blocks.
+            mlp_in = attn_res_view(
+                stack[: num_blocks + 2],
                 self.attn_res.mlp_queries[i],
-                None if messages is not None else layer.mlp_norm.weight,
+                None if messages is not None else layer.mlp_norm.w32(),
                 layer.mlp_norm.eps if messages is None else 0.0,
                 self.normalize_values,
+                tail=attn_out,
             )
         else:
-            mlp_in = attn_res(
-                stack[:num_blocks],
-                partial,
-                attn_out,
+            # sources = stack[:nb], last+addend = partial + attn_out: the
+            # view stack[:nb+1] with the fp32 addend added onto its last row.
+            mlp_in = attn_res_view(
+                stack[: num_blocks + 1],
                 self.attn_res.mlp_queries[i],
-                None if messages is not None else layer.mlp_norm.weight,
+                None if messages is not None else layer.mlp_norm.w32(),
                 layer.mlp_norm.eps if messages is None else 0.0,
                 self.normalize_values,
+                tail_add=attn_out,
             )
         if messages is not None:
             mlp_in = layer.blend(("mlp",), mlp_in, messages[3:], layer.mlp_norm)
@@ -337,12 +408,11 @@ class NpuLoopModel(nn.Module):
         acc = attn_out if residual is None else residual.float() + attn_out
         stack[num_blocks].copy_((acc + y.float()).to(stack.dtype))
 
-        outputs = attn_res(
-            stack[:num_blocks],
-            stack[num_blocks],
-            None,
+        # sources = stack[:nb], last = stack[nb]: contiguous stack[:nb+1].
+        outputs = attn_res_view(
+            stack[: num_blocks + 1],
             next_query,
-            None if next_norm is None else next_norm.weight,
+            None if next_norm is None else next_norm.w32(),
             0.0 if next_norm is None else next_norm.eps,
             self.normalize_values,
         )

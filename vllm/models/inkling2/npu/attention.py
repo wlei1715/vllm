@@ -82,44 +82,73 @@ class Inkling2NpuShortConv(nn.Module):
         # would rewrite the same frozen tensor.
         self._graph_mode = False
         self._gbuf: dict[tuple, torch.Tensor] = {}
+        # 6e: per-key (W, dim) scratch window — `[state; x]` assembled with
+        # two row copies instead of a cat (cat ~10 µs vs copy ~5 µs measured
+        # in-graph; values identical).
+        self._gwin: dict[tuple, torch.Tensor] = {}
+        # 6e: lazily cached fp32 copies of the constant conv weights (kills
+        # a per-call cast of a parameter).  Cache attribute `_w32buf`;
+        # builder `_w32()`.
+        self._w32buf: torch.Tensor | None = None
 
     def reset_state(self) -> None:
         self._past.clear()
         self._gbuf.clear()
+        self._gwin.clear()
 
     def reset_slot(self, slot: int) -> None:
         for key in [k for k in self._past if k[0] == slot]:
             self._past.pop(key, None)
         for key in [k for k in self._gbuf if k[0] == slot]:
             self._gbuf.pop(key, None)
+        for key in [k for k in self._gwin if k[0] == slot]:
+            self._gwin.pop(key, None)
 
     def enable_graph_mode(self) -> None:
         self._graph_mode = True
+
+    def _w32(self) -> torch.Tensor:
+        """fp32 copy of the constant conv weight(s), built lazily."""
+        w = self._w32buf
+        if w is None or w.device != (
+            self.static_w.device if self.dynamic else self.weight.device
+        ):
+            if self.dynamic:
+                w = self.static_w.detach().float()
+            else:
+                w = self.weight.reshape(self.dim, -1).detach().float()
+            self._w32buf = w
+        return w
 
     def _graph_forward(
         self,
         x: torch.Tensor,
         buf: torch.Tensor,
         dyn: torch.Tensor | None,
+        win: torch.Tensor,
     ) -> torch.Tensor:
         """T=1 in-place-state variant of the decode fast paths (`ops.py`)."""
         W = self.kernel_size
         head_dim = self.dim // max(self.num_heads, 1)
+        # Assemble the (W, C) window `[state; x]` into the scratch buffer:
+        # two row copies instead of a cat (6e; identical values).
+        win[: W - 1].copy_(buf)
+        win[W - 1:].copy_(x)
+        xt = win.float()  # (W, C)
         if not self.dynamic:
-            w = self.weight.reshape(self.dim, -1).float()
-            xt = torch.cat((buf, x), 0).float()  # (W, C)
+            w = self._w32()
             acc = (w.t() * xt).sum(0)
             y = (acc + x.squeeze(0).float()) * (W + 1) ** -0.5
         else:
             assert dyn is not None
-            xt = torch.cat((buf, x), 0).float()  # (W, C)
-            taps = self.static_w.float() + dyn[0].repeat_interleave(
+            taps = self._w32() + dyn[0].repeat_interleave(
                 head_dim, dim=0
             ).t()
             acc = (taps * xt.flip(0)).sum(0)
             y = (acc + x.squeeze(0).float()) * (2 * W + 1) ** -0.5
-        # Rolling in-place state update == `cat(past[1:], x)` of the cat path.
-        buf.copy_(torch.cat((buf[1:], x), 0))
+        # Rolling in-place state update == `cat(past[1:], x)` of the cat path
+        # (win[1:] == [buf[1:], x], non-overlapping with buf).
+        buf.copy_(win[1:])
         return y.unsqueeze(0)
 
     def forward(
@@ -139,12 +168,16 @@ class Inkling2NpuShortConv(nn.Module):
                 if past is not None:
                     buf.copy_(past.to(x.dtype))
                 self._gbuf[key] = buf
+            win = self._gwin.get(key)
+            if win is None:
+                win = x.new_zeros((self.kernel_size, self.dim))
+                self._gwin[key] = win
             dyn = None
             if self.dynamic:
                 assert x_dynamic is not None
                 dyn = torch.nn.functional.linear(x_dynamic, self.weight_proj)
                 dyn = dyn.view(x.shape[0], self.num_heads, self.kernel_size)
-            return self._graph_forward(x, buf, dyn)
+            return self._graph_forward(x, buf, dyn, win)
         past = self._past.get(key)
         if self.dynamic:
             assert x_dynamic is not None
@@ -255,6 +288,14 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         self._s_pad: int | None = None
         self._gcache: dict = {}
         self._scales_synced = False
+        # 6e: lazily built CONCATENATED projection weights — the local layers'
+        # six prologue GEMMs share one input, so they fuse into a single
+        # GEMM on the concatenated weight (bit-exact: same K-reduction, the
+        # aclnn tiling does not change it — verified 6e_proj_micro.py, and
+        # it halves the projection time in-graph: 41.8 -> 18.6 us/visit).
+        # Full layers group per input: (wq, wr, gate, sink) on x_q and
+        # (wk, wv) on x_k.
+        self._fused_w: tuple | None = None
         # 6d: fused attention core (torch_npu.npu_fusion_attention), opt-in
         # via INKLING2_NPU_FIA=1 (default off -- keeps the torch composite as
         # the A/B reference). Empirically confirmed (probe_fia_pse.py +
@@ -414,12 +455,30 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
             self._r_scale_f.copy_(self.r_scale.float())
             self._scales_synced = True
 
-        q = self.wq_du(x_q).view(T, H, D)
-        r = self.wr_du(x_q).view(T, H, self.d_rel)
-        gate = self.gate_attn(x_q).view(T, H, D)
-        sinks = self.attn_sink_proj(x_q).view(T, H)
-        k = self.wk_dv(x_k).view(T, Hkv, D)
-        v = self.wv_dv(x_v).view(T, Hkv, D)
+        # 6e: the prologue GEMMs on one input run as a single GEMM over the
+        # concatenated weight (bit-exact, see `_build_fused_w`).  Local
+        # layers fuse all six (x_q == x_k == x_v); full layers fuse the
+        # four x_q projections (x_k / x_v are distinct inputs there).
+        qs, rs, gs, ss = H * D, H * self.d_rel, H * D, H
+        ks = Hkv * D
+        if self.is_local:
+            w_all, _ = self._build_fused_w()
+            y = torch.nn.functional.linear(x_q, w_all)
+            q = y[:, :qs].reshape(T, H, D)
+            r = y[:, qs:qs + rs].reshape(T, H, self.d_rel)
+            gate = y[:, qs + rs:qs + rs + gs].reshape(T, H, D)
+            sinks = y[:, qs + rs + gs:qs + rs + gs + ss].reshape(T, H)
+            k = y[:, qs + rs + gs + ss:qs + rs + gs + ss + ks].reshape(T, Hkv, D)
+            v = y[:, qs + rs + gs + ss + ks:].reshape(T, Hkv, D)
+        else:
+            w_q, _ = self._build_fused_w()
+            y = torch.nn.functional.linear(x_q, w_q)
+            q = y[:, :qs].reshape(T, H, D)
+            r = y[:, qs:qs + rs].reshape(T, H, self.d_rel)
+            gate = y[:, qs + rs:qs + rs + gs].reshape(T, H, D)
+            sinks = y[:, qs + rs + gs:].reshape(T, H)
+            k = self.wk_dv(x_k).view(T, Hkv, D)
+            v = self.wv_dv(x_v).view(T, Hkv, D)
 
         # Prologue: clip q/r (round then scale by tau), K/V convs + norms.
         q_clip = l2_clip(q, self._q_scale_f, self.qk_clip, tau=tau).to(torch.bfloat16)
@@ -589,6 +648,41 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         lse = (ret[1][..., 0] + ret[2][..., 0].log()).squeeze(0)  # (H, T)
         return out, lse
 
+    def _build_fused_w(self) -> tuple:
+        """Concatenated projection weights (see `__init__`, 6e)."""
+        fw = self._fused_w
+        dev = self.wq_du.weight.device
+        if fw is None or fw[0].device != dev:
+            if self.is_local:
+                w_all = torch.cat(
+                    [
+                        self.wq_du.weight,
+                        self.wr_du.weight,
+                        self.gate_attn.weight,
+                        self.attn_sink_proj.weight,
+                        self.wk_dv.weight,
+                        self.wv_dv.weight,
+                    ],
+                    0,
+                ).contiguous()
+                fw = (w_all, None)
+            else:
+                w_q = torch.cat(
+                    [
+                        self.wq_du.weight,
+                        self.wr_du.weight,
+                        self.gate_attn.weight,
+                        self.attn_sink_proj.weight,
+                    ],
+                    0,
+                ).contiguous()
+                w_kv = torch.cat(
+                    [self.wk_dv.weight, self.wv_dv.weight], 0
+                ).contiguous()
+                fw = (w_q, w_kv)
+            self._fused_w = fw
+        return fw
+
     def _rel_scores(
         self,
         r_clip: torch.Tensor,
@@ -601,7 +695,13 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
         `k_pos` are the positions of the cached keys (prefill + decoded so
         far); `q_pos` the current step's query positions.
         """
-        rel = rel_bias(r_clip, self.rel_logits_proj, self.rel_extent)  # (T,H,E)
+        # 6e: fp32 copy of the constant rel projection (built lazily);
+        # `rel_bias`'s `rel_proj.float()` is a no-op on it, values identical.
+        rp = getattr(self, "_rel_proj_f", None)
+        if rp is None or rp.device != self.rel_logits_proj.device:
+            rp = self.rel_logits_proj.detach().float()
+            self._rel_proj_f = rp
+        rel = rel_bias(r_clip, rp, self.rel_extent)  # (T,H,E)
         dist = q_pos[:, None] - k_pos[None, :]  # (T, S)
         idx = dist.clamp(0, self.rel_extent - 1)
         bias = rel.permute(1, 0, 2).gather(

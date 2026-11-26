@@ -207,6 +207,72 @@ def attn_res(
     return (mix * norm_weight.float().unsqueeze(1)).to(torch.bfloat16)
 
 
+def attn_res_view(
+    x_view: torch.Tensor,
+    queries: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+    normalize_values: bool,
+    tail: torch.Tensor | None = None,
+    tail_add: torch.Tensor | None = None,
+    eps: float = ATTN_RES_EPS,
+) -> torch.Tensor:
+    """`attn_res` on a CONTIGUOUS bf16 view holding every source and the
+    last row (6e op-count optimization; values are bit-identical to
+    `attn_res([*x_view[:-1]], x_view[-1], ...)`: same casts, same ops).
+
+    `x_view` is `(N, T, D)` bf16 — e.g. the loop `stack[:n]` slice whose
+    rows are the attention-residual sources and whose last row is `last`.
+    `tail` REPLACES the cast copy of the last row (the caller has it in
+    fp32 already); `tail_add` is ADDED to it (the `last + addend` case).
+    """
+    x = x_view.float()
+    if tail is not None:
+        x[-1] = tail
+    elif tail_add is not None:
+        x[-1] += tail_add
+    rstd = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)  # (N, T, 1)
+    rstd_t = rstd.squeeze(-1).unsqueeze(1)  # (N, 1, T)
+    q = queries.float()
+    logits = torch.einsum("qd,ntd->nqt", q, x) * rstd_t
+    probs = torch.exp(logits - logits.amax(0, keepdim=True))
+    inv_sum = 1.0 / probs.sum(0)  # (Q, T)
+    if normalize_values:
+        probs = probs * rstd_t
+    mix = torch.einsum("nqt,ntd->qtd", probs, x) * inv_sum.unsqueeze(-1)
+    if norm_weight is None:
+        return mix
+    mix = mix * torch.rsqrt(mix.square().mean(-1, keepdim=True) + norm_eps)
+    return (mix * norm_weight.float().unsqueeze(1)).to(torch.bfloat16)
+
+
+def blend_fast(
+    dest: torch.Tensor,
+    message: torch.Tensor,
+    down_t: torch.Tensor,
+    up_t32: torch.Tensor,
+    norm_weight32: torch.Tensor,
+    norm_eps: float,
+    eps: float = ATTN_RES_EPS,
+) -> torch.Tensor:
+    """`blend` on PRE-TRANSPOSED constant weights (6e): `down_t` is
+    `(S, 2D, r)` bf16 (`down.transpose(1, 2)` made contiguous at load) and
+    `up_t32` is `(S, r, 2D)` fp32 (`up.transpose(1, 2).contiguous().float()`
+    at load), `norm_weight32` fp32.  Kills the per-call stack/transpose/cast
+    of constant controller weights; the arithmetic is bit-identical.
+    """
+    d_rstd = torch.rsqrt(dest.square().mean(-1, keepdim=True) + eps)
+    m_rstd = torch.rsqrt(message.square().mean(-1, keepdim=True) + eps)
+    pair = torch.cat((dest * d_rstd, message * m_rstd), -1).to(torch.bfloat16)
+    hidden = torch.bmm(pair, down_t)  # bf16 (S, T, r)
+    gf = torch.bmm(hidden.float(), up_t32)  # fp32 (S, T, 2D)
+    d = dest.shape[-1]
+    gain, forget = gf[..., :d], gf[..., d:]
+    x = (1.0 - torch.tanh(forget)) * dest + torch.tanh(gain) * message
+    x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
+    return (x * norm_weight32.unsqueeze(1)).to(torch.bfloat16)
+
+
 def blend(
     dest: torch.Tensor,
     message: torch.Tensor,
@@ -279,7 +345,9 @@ def current_slot() -> int:
 
 __all__ = [
     "attn_res",
+    "attn_res_view",
     "blend",
+    "blend_fast",
     "expert_activation",
     "feature_rms",
     "gate_sink",
