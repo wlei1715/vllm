@@ -18,17 +18,10 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    from vllm.platforms import current_platform
-
-    npu = current_platform.device_type == "npu"
     if name == "Inkling2DSparkModel":
         from .nvidia import dspark
 
         return dspark.Inkling2DSparkModel
-    if name == "Inkling2LoopForConditionalGeneration" and npu:
-        from .npu import loop
-
-        return loop.Inkling2LoopForConditionalGeneration
     if name == "Inkling2LoopForConditionalGeneration":
         from .nvidia import loop
 
